@@ -1,9 +1,10 @@
 {
   "name": "mini-office",
   "private": true,
+  "license": "MIT",
   "version": "0.1.0",
   "type": "module",
-  "description": "A Habbo-style pixel office where every project is a room and every AI agent is a person.",
+  "description": "A retro isometric pixel office where every project is a room and every AI agent is a person.",
   "engines": {
     "node": ">=22.18"
   },
