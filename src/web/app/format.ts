@@ -24,3 +24,15 @@ export function hudIcon(person: HudPerson): StatusIcon {
   if (person.whereabouts === 'dozing') return 'sleeping';
   return person.activity;
 }
+
+/** "claude-opus-5-5" → "Opus 5.5"; anything else is shown as it comes. */
+export function modelName(model: string): string {
+  const match = /^claude-([a-z]+)-(\d+)(?:-(\d+))?/.exec(model);
+  if (!match?.[1] || !match[2]) return model;
+  const family = match[1].charAt(0).toUpperCase() + match[1].slice(1);
+  return `${family} ${match[2]}${match[3] ? `.${match[3]}` : ''}`;
+}
+
+export function ago(ms: number): string {
+  return ms < 10_000 ? messages.card.justNow : format(messages.card.ago, { time: duration(ms) });
+}

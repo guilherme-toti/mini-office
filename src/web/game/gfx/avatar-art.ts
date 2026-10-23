@@ -12,7 +12,8 @@ export const AVATAR_HEAD_TOP = 40;
 
 /** front = facing south-east (we see the face), back = facing north-east. Mirrors give the rest. */
 export type AvatarView = 'front' | 'back';
-export type AvatarPose = 'stand' | 'walk' | 'sit' | 'type' | 'drink' | 'wave' | 'sleep';
+/** `play` is standing with both hands busy: arcade sticks, a ping-pong paddle. */
+export type AvatarPose = 'stand' | 'walk' | 'sit' | 'type' | 'drink' | 'wave' | 'sleep' | 'play';
 
 export interface AvatarFrame {
   look: Look;
@@ -200,8 +201,8 @@ function drawArms(
   };
 
   // Back arm (far side) first.
-  if (pose === 'type' || pose === 'sleep') {
-    const lift = pose === 'type' ? frame % 2 : 0;
+  if (pose === 'type' || pose === 'sleep' || pose === 'play') {
+    const lift = pose === 'sleep' ? 0 : frame % 2;
     arm(5, top + 1 + lift, 7, c.topShade);
     arm(18, top + 1 + (1 - lift), 7, c.topShade);
     return;

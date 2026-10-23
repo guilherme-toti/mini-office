@@ -1,14 +1,15 @@
-import type { Activity, AgentKind, OfficeSnapshot } from '../../shared/protocol.ts';
+import type { Activity, AgentInsight, AgentKind, OfficeSnapshot } from '../../shared/protocol.ts';
 import { messages } from '../i18n/index.ts';
 import { project } from './gfx/iso.ts';
-import { roomBounds, type Rect } from './layout/office-layout.ts';
+import { floorBounds } from './gfx/floor-art.ts';
 import { Camera, type Insets } from './render/camera.ts';
 import { Renderer } from './render/renderer.ts';
 import type { Look } from './sim/persona.ts';
-import { LOUNGE_ID, type LogEntry, type RoomPhase } from './sim/types.ts';
+import type { LogEntry, Person } from './sim/types.ts';
 import { World } from './sim/world.ts';
 
-export type Whereabouts = 'desk' | 'lounge' | 'walking' | 'away' | 'dozing';
+export type Whereabouts =
+  'desk' | 'kitchen' | 'lounge' | 'games' | 'meeting' | 'terrace' | 'walking' | 'away' | 'dozing';
 
 export interface HudPerson {
   id: string;
@@ -22,7 +23,9 @@ export interface HudPerson {
   activitySince: number;
   roomId: string;
   roomName: string;
+  parentId: string | null;
   parentName: string | null;
+  insight: AgentInsight;
   whereabouts: Whereabouts;
 }
 
@@ -30,7 +33,7 @@ export interface HudRoom {
   id: string;
   name: string;
   count: number;
-  phase: RoomPhase;
+  phase: 'open' | 'renovating';
 }
 
 export interface HudState {
@@ -171,13 +174,11 @@ export class OfficeEngine {
     if (!this.renderer || this.width === 0) return;
     this.world.tick(dt, Date.now());
 
-    if (this.camera.autoFit && this.fittedVersion !== this.world.layoutVersion) {
-      const bounds = this.officeBounds();
-      if (bounds) {
-        this.camera.fit(bounds, this.width, this.height, this.scaledInsets(), !this.hasFitted);
-        this.hasFitted = true;
-      }
-      this.fittedVersion = this.world.layoutVersion;
+    if (this.camera.autoFit && this.fittedVersion !== this.world.floorVersion) {
+      const bounds = floorBounds(this.world.floor.width, this.world.floor.depth);
+      this.camera.fit(bounds, this.width, this.height, this.scaledInsets(), !this.hasFitted);
+      this.hasFitted = true;
+      this.fittedVersion = this.world.floorVersion;
     }
     if (this.followId) this.follow(this.followId);
     this.camera.update(dt);
@@ -189,7 +190,7 @@ export class OfficeEngine {
       selectedId: this.selectedId,
       hoverId: this.hoverId,
       showNames: this.showNames,
-      loungeName: messages.panel.lounge,
+      zoneNames: messages.zones,
       renovatingLabel: messages.room.renovating,
     });
 
@@ -202,42 +203,13 @@ export class OfficeEngine {
 
   private follow(id: string): void {
     const person = this.world.people.get(id);
-    const room = person?.room ? this.world.rooms.get(person.room) : undefined;
-    if (!person || !room) return;
+    if (!person) return;
     // Aim a little above the feet, at the middle of the body.
-    const feet = project(person.x + 0.5, person.y + 0.5, 20);
-    const feetX = room.origin.x + feet.x;
-    const feetY = room.origin.y + feet.y;
+    const { x: feetX, y: feetY } = project(person.x + 0.5, person.y + 0.5, 20);
     this.camera.focus(feetX, feetY, 3 * this.dpr);
     // Follow only until the camera arrives; after that the user is free to look around.
     if (Math.abs(this.camera.x - feetX) < 2 && Math.abs(this.camera.y - feetY) < 2)
       this.followId = null;
-  }
-
-  private officeBounds(): Rect | null {
-    let bounds: Rect | null = null;
-    for (const room of this.world.rooms.values()) {
-      const local = roomBounds(room.layout.width, room.layout.depth);
-      const rect = {
-        x: room.target.x + local.x,
-        y: room.target.y + local.y,
-        width: local.width,
-        height: local.height,
-      };
-      if (!bounds) {
-        bounds = rect;
-        continue;
-      }
-      const x = Math.min(bounds.x, rect.x);
-      const y = Math.min(bounds.y, rect.y);
-      bounds = {
-        x,
-        y,
-        width: Math.max(bounds.x + bounds.width, rect.x + rect.width) - x,
-        height: Math.max(bounds.y + bounds.height, rect.y + rect.height) - y,
-      };
-    }
-    return bounds;
   }
 
   private scaledInsets(): Insets {
@@ -259,9 +231,6 @@ export class OfficeEngine {
     this.height = Math.round(rect.height * this.dpr);
     canvas.width = this.width;
     canvas.height = this.height;
-    const usableW = rect.width - this.insets.left - this.insets.right;
-    const usableH = rect.height - this.insets.top - this.insets.bottom;
-    this.world.setAspect(usableH > 0 ? usableW / usableH : 1.6);
     this.fittedVersion = -1;
   }
 
@@ -361,6 +330,16 @@ export class OfficeEngine {
       : { x: this.width / 2, y: this.height / 2 };
   }
 
+  private whereabouts(person: Person): Whereabouts {
+    const world = this.world;
+    if (person.stage !== 'present') return 'away';
+    if (person.path.length > 0 || person.arrivedAt === null) return 'walking';
+    if (world.isDozing(person)) return 'dozing';
+    if (person.dest?.goal === 'desk') return 'desk';
+    const zone = world.zoneAt(person.x, person.y);
+    return zone && zone.kind !== 'team' ? zone.kind : 'walking';
+  }
+
   // ─── HUD feed ─────────────────────────────────────────────────────────────────────────────
 
   private publish(): void {
@@ -368,15 +347,8 @@ export class OfficeEngine {
     const people: HudPerson[] = [];
     for (const person of world.people.values()) {
       if (person.departing && person.stage === 'hidden') continue;
-      const room = world.rooms.get(person.home);
+      const team = world.teams.get(person.home);
       const parent = person.agent.parentId ? world.people.get(person.agent.parentId) : undefined;
-      let whereabouts: Whereabouts = 'walking';
-      if (person.stage === 'transit' || person.stage === 'hidden') whereabouts = 'away';
-      else if (person.path.length === 0 && person.arrivedAt !== null) {
-        if (world.isDozing(person)) whereabouts = 'dozing';
-        else if (person.room === LOUNGE_ID) whereabouts = 'lounge';
-        else if (person.dest?.goal === 'desk') whereabouts = 'desk';
-      }
       people.push({
         id: person.id,
         name: person.name,
@@ -388,19 +360,20 @@ export class OfficeEngine {
         detail: person.agent.detail,
         activitySince: person.agent.activitySince,
         roomId: person.home,
-        roomName: room?.name ?? '',
+        roomName: team?.name ?? '',
+        parentId: person.agent.parentId,
         parentName: parent?.name ?? null,
-        whereabouts,
+        insight: person.agent.insight,
+        whereabouts: this.whereabouts(person),
       });
     }
-    const rooms: HudRoom[] = [...world.rooms.values()]
-      .filter((room) => room.kind === 'work')
+    const rooms: HudRoom[] = [...world.teams.values()]
       .sort((a, b) => a.order - b.order)
-      .map((room) => ({
-        id: room.id,
-        name: room.name,
-        count: people.filter((person) => person.roomId === room.id).length,
-        phase: room.phase,
+      .map((team) => ({
+        id: team.id,
+        name: team.name,
+        count: people.filter((person) => person.roomId === team.id).length,
+        phase: world.teamPhase(team.id),
       }));
     this.hud = {
       people,

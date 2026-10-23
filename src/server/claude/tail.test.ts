@@ -52,6 +52,27 @@ describe('transcript tail', () => {
     expect(tail.state.title).toBe('New');
   });
 
+  it('looks further back when huge tool output hides the latest request', async () => {
+    const steps = Array.from({ length: 5 }, (_, index) =>
+      line({
+        type: 'assistant',
+        message: { content: [{ type: 'tool_use', id: `t${index}`, name: 'Read', input: {} }] },
+      }),
+    ).join('');
+    const screenshot = line({
+      type: 'user',
+      message: {
+        content: [{ type: 'tool_result', tool_use_id: 't4', content: 'x'.repeat(900_000) }],
+      },
+    });
+    const ask = line({ type: 'user', message: { content: 'Polish the dashboard' } });
+    await writeFile(path, ask + steps + screenshot);
+    const tail = new TranscriptTail(path);
+    await tail.poll(0);
+    expect(tail.state.prompt).toBe('Polish the dashboard');
+    expect(tail.state.steps).toHaveLength(5);
+  });
+
   it('ignores a missing file', async () => {
     const tail = new TranscriptTail(join(dir, 'nope.jsonl'));
     await expect(tail.poll(0)).resolves.toBeUndefined();

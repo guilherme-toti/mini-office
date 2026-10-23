@@ -22,9 +22,14 @@ const ToolInputSchema = z.looseObject({
 /** Long unbroken runs of letters and digits look like keys or tokens; never show those. */
 const SECRET_LIKE = /[A-Za-z0-9_\-+/=]{24,}/g;
 
-function truncate(text: string): string {
+/** One line of text, secrets masked, cut to `max` characters. Everything shown goes through it. */
+export function clip(text: string, max: number): string {
   const oneLine = text.replace(SECRET_LIKE, '•••').replace(/\s+/g, ' ').trim();
-  return oneLine.length > DETAIL_MAX ? `${oneLine.slice(0, DETAIL_MAX - 1)}…` : oneLine;
+  return oneLine.length > max ? `${oneLine.slice(0, max - 1)}…` : oneLine;
+}
+
+function truncate(text: string): string {
+  return clip(text, DETAIL_MAX);
 }
 
 function baseName(path: string | undefined): string | null {
@@ -72,6 +77,11 @@ const PLAN_TOOLS = new Set([
 const ASK_TOOLS = new Set(['AskUserQuestion', 'ExitPlanMode']);
 const DELEGATE_TOOLS = new Set(['Agent', 'Task', 'SendMessage']);
 const THINK_TOOLS = new Set(['ToolSearch', 'SubagentHandback']);
+
+/** Bookkeeping tools that are not steps of the actual work. */
+export function isBookkeeping(name: string): boolean {
+  return THINK_TOOLS.has(name);
+}
 
 /** Maps a tool call to what a person in the office would look like they are doing. */
 export function toolActivity(name: string, rawInput: unknown): ToolActivity {

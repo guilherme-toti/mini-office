@@ -43,7 +43,7 @@ export function TeamPanel({
       {rooms.map((room) => {
         const members = orderByTeam(people.filter((person) => person.roomId === room.id));
         if (members.length === 0) return null;
-        const renovating = room.phase === 'evacuating' || room.phase === 'building';
+        const renovating = room.phase === 'renovating';
         return (
           <section key={room.id} aria-label={room.name}>
             <h3 className="flex items-center gap-2 px-2 pb-1 text-sm font-bold tracking-wide text-muted uppercase">

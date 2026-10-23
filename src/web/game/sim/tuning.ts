@@ -3,7 +3,6 @@ export const TUNING = {
   walkSpeed: 2.4,
   hurrySpeed: 4.2,
   doorFade: 0.4,
-  transit: 0.8,
   /** After finishing, an agent waits at the desk with a raised hand this long… */
   waitAtDeskMs: 40_000,
   /** …then takes a break in the lounge, and after this long dozes off back at the desk. */
@@ -15,7 +14,6 @@ export const TUNING = {
   checkInEvery: 35,
   minGoalHold: 5,
   build: 2.8,
-  close: 0.9,
   closeAfterEmpty: 45,
   shrinkAfter: 90,
   evacuateTimeout: 14,

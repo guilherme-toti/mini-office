@@ -1,4 +1,4 @@
-import type { Activity, AgentSnapshot, RoomSnapshot } from '../../shared/protocol.ts';
+import type { Activity, AgentInsight, AgentSnapshot, RoomSnapshot } from '../../shared/protocol.ts';
 import { between, createRandom, pick } from '../../shared/random.ts';
 import { PollingSource } from '../source.ts';
 
@@ -29,6 +29,71 @@ const HELPER_TASKS = [
   'Check the page on mobile',
   'Write the migration tests',
 ];
+
+const PROMPTS = [
+  'Add Apple Pay to the checkout and keep the old card flow working',
+  'The invoice tests fail every other run. Find out why and fix it',
+  'Make the settings screen work offline',
+  'Move the orders table to UUID keys without downtime',
+  'Polish the empty states on the dashboard',
+];
+const BRANCHES = ['main', 'feat/apple-pay', 'fix/invoice-tests', 'chore/uuid-keys'];
+const MODELS = ['claude-opus-5-5', 'claude-sonnet-5-5'];
+const SAID: Record<Activity, string> = {
+  editing: 'Updating {detail} so the totals include tax.',
+  reading: 'Let me look at how {detail} is wired before changing it.',
+  running: 'Running this to make sure nothing broke.',
+  browsing: 'Checking the docs for the right way to do this.',
+  thinking: 'I think the bug is in the rounding step. Checking that next.',
+  planning: 'Splitting this into three smaller steps.',
+  delegating: 'Asking a helper to take part of this.',
+  waiting: 'Done. Checkout now takes Apple Pay and the tests pass. Want me to open a PR?',
+};
+/** Activities that are a tool call, so they show up as a step on the person card. */
+const STEP_ACTIVITIES = new Set<Activity>([
+  'editing',
+  'reading',
+  'running',
+  'browsing',
+  'delegating',
+]);
+
+/** What a demo agent's card would say after it moves on to a new activity. */
+function advance(
+  insight: AgentInsight,
+  activity: Activity,
+  detail: string | null,
+  now: number,
+  random: () => number,
+): AgentInsight {
+  const steps = insight.steps.map((step, index) =>
+    index === 0 && step.result === 'running'
+      ? {
+          ...step,
+          result:
+            step.activity === 'running' && random() < 0.15 ? ('failed' as const) : ('ok' as const),
+        }
+      : step,
+  );
+  const failed = steps[0]?.result === 'failed' && insight.steps[0]?.result === 'running' ? 1 : 0;
+  const isStep = STEP_ACTIVITIES.has(activity);
+  return {
+    ...insight,
+    said: SAID[activity].replace('{detail}', detail ?? 'this'),
+    steps: isStep
+      ? [{ activity, detail, at: now, result: 'running' as const }, ...steps].slice(0, 8)
+      : steps,
+    files:
+      activity === 'editing' && detail
+        ? [detail, ...insight.files.filter((file) => file !== detail)].slice(0, 6)
+        : insight.files,
+    counts: {
+      steps: insight.counts.steps + (isStep ? 1 : 0),
+      commands: insight.counts.commands + (activity === 'running' ? 1 : 0),
+      failures: insight.counts.failures + failed,
+    },
+  };
+}
 
 interface DemoAgent {
   snapshot: AgentSnapshot;
@@ -124,6 +189,15 @@ export class DemoSource extends PollingSource {
         detail: null,
         activitySince: now,
         startedAt: now,
+        insight: {
+          prompt: pick(this.random, PROMPTS),
+          said: SAID.thinking,
+          steps: [],
+          files: [],
+          counts: { steps: 0, commands: 0, failures: 0 },
+          branch: pick(this.random, BRANCHES),
+          model: pick(this.random, MODELS),
+        },
       },
       nextChangeAt: now + between(this.random, 4000, 9000),
       leavesAt: null,
@@ -139,12 +213,7 @@ export class DemoSource extends PollingSource {
     }
     const activity = helper ? pick(this.random, HELPER_ACTIVITIES) : weighted(this.random, WEIGHTS);
     const details = DETAILS[activity];
-    agent.snapshot = {
-      ...agent.snapshot,
-      activity,
-      detail: details ? pick(this.random, details) : null,
-      activitySince: now,
-    };
+    this.setActivity(agent, activity, details ? pick(this.random, details) : null, now);
     const long = activity === 'waiting' || activity === 'running';
     agent.nextChangeAt = now + between(this.random, long ? 15_000 : 4000, long ? 70_000 : 12_000);
   }
@@ -153,32 +222,57 @@ export class DemoSource extends PollingSource {
     const parent = parents[0];
     if (!parent) return;
     const task = pick(this.random, HELPER_TASKS);
-    parent.snapshot = {
-      ...parent.snapshot,
-      activity: 'delegating',
-      detail: task,
-      activitySince: now,
-    };
+    this.setActivity(parent, 'delegating', task, now);
     for (let index = 0; index < helpers; index += 1) {
       this.counter += 1;
       const id = `${parent.snapshot.id}/helper-${this.counter}`;
+      const label = index === 0 ? task : pick(this.random, HELPER_TASKS);
+      const detail = pick(this.random, DETAILS.reading ?? []);
       this.agents.set(id, {
         snapshot: {
           id,
           kind: 'subagent',
           parentId: parent.snapshot.id,
           roomId: parent.snapshot.roomId,
-          label: index === 0 ? task : pick(this.random, HELPER_TASKS),
+          label,
           role: pick(this.random, HELPER_ROLES),
           activity: 'reading',
-          detail: pick(this.random, DETAILS.reading ?? []),
+          detail,
           activitySince: now,
           startedAt: now,
+          insight: advance(
+            {
+              ...parent.snapshot.insight,
+              prompt: `${label}. Report back with what you find.`,
+              steps: [],
+              files: [],
+              counts: { steps: 0, commands: 0, failures: 0 },
+            },
+            'reading',
+            detail,
+            now,
+            this.random,
+          ),
         },
         nextChangeAt: now + between(this.random, 5000, 10_000),
         leavesAt: now + between(this.random, 25_000, 50_000),
       });
     }
+  }
+
+  private setActivity(
+    agent: DemoAgent,
+    activity: Activity,
+    detail: string | null,
+    now: number,
+  ): void {
+    agent.snapshot = {
+      ...agent.snapshot,
+      activity,
+      detail,
+      activitySince: now,
+      insight: advance(agent.snapshot.insight, activity, detail, now, this.random),
+    };
   }
 
   /** A parent stops delegating once its last helper has gone home. */
@@ -191,7 +285,7 @@ export class DemoSource extends PollingSource {
     for (const agent of this.sessions()) {
       if (agent.snapshot.activity === 'delegating' && !parentsWithHelpers.has(agent.snapshot.id)) {
         agent.nextChangeAt = now;
-        agent.snapshot = { ...agent.snapshot, activity: 'thinking', detail: null };
+        this.setActivity(agent, 'thinking', null, now);
       }
     }
   }

@@ -5,8 +5,9 @@ import {
   AVATAR_W,
   type AvatarView,
 } from '../gfx/avatar-art.ts';
+import { tileVariant } from '../gfx/floor-art.ts';
 import { FURNITURE_ANCHOR_X, FURNITURE_ANCHOR_Y } from '../gfx/furniture-art.ts';
-import { HALF_H, HALF_W, project } from '../gfx/iso.ts';
+import { project } from '../gfx/iso.ts';
 import {
   SCREEN_FRAMES,
   screenPatternFor,
@@ -14,10 +15,9 @@ import {
   type StatusIcon,
 } from '../gfx/overlay-art.ts';
 import { type Pixmap } from '../gfx/pixmap.ts';
-import { WALL_HEIGHT } from '../layout/office-layout.ts';
-import type { Furniture } from '../layout/types.ts';
+import { inRect, type Furniture, type Rect, type Zone, type ZoneKind } from '../layout/types.ts';
 import { TUNING } from '../sim/tuning.ts';
-import { LOUNGE_ID, type Bubble, type Person, type WorldRoom } from '../sim/types.ts';
+import type { Bubble, Person } from '../sim/types.ts';
 import type { World } from '../sim/world.ts';
 import type { Camera } from './camera.ts';
 import { LabelPlacer } from './label-placer.ts';
@@ -36,6 +36,7 @@ function readInk() {
     plate: token('color-plate'),
     plateBorder: token('color-panel-edge'),
     plateText: token('color-cream'),
+    plateMuted: token('color-muted'),
     plateCount: token('color-sun'),
     renovate: token('color-amber'),
     shadow: token('color-shade'),
@@ -52,6 +53,13 @@ const MAX_BUBBLES = 6;
 /** Art pixels between the head and the first line of text: status bubble, then arrow. */
 const STACK_PLAIN = 25;
 const STACK_SELECTED = 34;
+/** How high above the floor a zone's name plate floats, in art pixels. */
+const PLATE_HEIGHT = 38;
+/** Shared-space plates only show once you zoom in (CSS px per art pixel); teams always do. */
+const SHARED_PLATES_FROM = 1;
+const CULL_MARGIN = 64;
+
+export type SharedZone = Exclude<ZoneKind, 'team'>;
 
 export interface RenderView {
   width: number;
@@ -61,7 +69,7 @@ export interface RenderView {
   selectedId: string | null;
   hoverId: string | null;
   showNames: boolean;
-  loungeName: string;
+  zoneNames: Record<SharedZone, string>;
   renovatingLabel: string;
 }
 
@@ -73,6 +81,14 @@ interface DrawnPerson {
   y: number;
   scale: number;
   head: { x: number; y: number };
+}
+
+interface Frame {
+  view: RenderView;
+  scale: number;
+  origin: { x: number; y: number };
+  /** The visible part of the world, in art pixels. */
+  visible: { left: number; right: number; top: number; bottom: number };
 }
 
 const clamp = (value: number, min = 0, max = 1) => Math.max(min, Math.min(max, value));
@@ -94,18 +110,29 @@ export class Renderer {
     this.drawVoid(view);
     const origin = camera.offset(view.width, view.height);
     const scale = camera.scale;
+    const frame: Frame = {
+      view,
+      scale,
+      origin,
+      visible: {
+        left: -origin.x / scale - CULL_MARGIN,
+        right: (view.width - origin.x) / scale + CULL_MARGIN,
+        top: -origin.y / scale - CULL_MARGIN,
+        bottom: (view.height - origin.y) / scale + CULL_MARGIN,
+      },
+    };
     ctx.setTransform(scale, 0, 0, scale, origin.x, origin.y);
     ctx.imageSmoothingEnabled = false;
 
     this.drawn = [];
-    const rooms = [...world.rooms.values()].sort((a, b) => a.origin.y - b.origin.y);
-    for (const room of rooms) this.drawRoom(world, room, view, scale, origin);
-    for (const item of this.drawn) this.drawStatus(world, item, view, scale, origin);
+    this.drawFloor(world);
+    this.drawScene(world, frame);
+    for (const item of this.drawn) this.drawStatus(world, item, frame);
 
     ctx.setTransform(1, 0, 0, 1, 0, 0);
     // Plates claim their spot first, so names and speech stack around them instead of hiding them.
     const placer = new LabelPlacer(4 * view.dpr);
-    for (const room of rooms) this.drawRoomLabel(world, room, view, scale, origin, placer);
+    for (const zone of world.floor.zones) this.drawZoneLabel(world, zone, frame, placer);
     const audible = newestBubbles(this.drawn.map((item) => item.person));
     for (const item of this.drawn) this.drawNameAndSpeech(item, view, audible, placer);
   }
@@ -148,155 +175,140 @@ export class Renderer {
     ctx.fillRect(0, 0, view.width, view.height);
   }
 
-  private drawRoom(
-    world: World,
-    room: WorldRoom,
-    view: RenderView,
-    scale: number,
-    origin: { x: number; y: number },
-  ): void {
+  /** Areas being built right now, with how far along they are (0–1). */
+  private building(world: World): { rects: Rect[]; progress: number } | null {
+    const renovation = world.renovation;
+    if (renovation?.phase !== 'building') return null;
+    const rects = world.floor.zones
+      .filter((zone) => renovation.zones.has(zone.id))
+      .map((zone) => zone.rect);
+    return { rects, progress: clamp(renovation.time / TUNING.build) };
+  }
+
+  private drawFloor(world: World): void {
     const ctx = this.context;
-    const ox = Math.round(room.origin.x);
-    const oy = Math.round(room.origin.y);
-    const { width: w, depth: d } = room.layout;
+    const plan = world.floor;
+    const building = this.building(world);
+    const skip = (x: number, y: number) =>
+      building?.rects.some((rect) => inRect(rect, { x, y })) ?? false;
+    const key = `${world.floorVersion}|${building ? 'building' : 'done'}`;
+    const art = this.sprites.floor(plan, key, skip);
+    ctx.drawImage(art.walls, -art.originX, -art.originY);
+    ctx.drawImage(art.floor, -art.originX, -art.originY);
+    if (!building) return;
 
-    // Skip rooms that are fully off screen.
-    const left = origin.x + (ox - d * HALF_W - 20) * scale;
-    const right = origin.x + (ox + w * HALF_W + 20) * scale;
-    const top = origin.y + (oy - WALL_HEIGHT - 40) * scale;
-    const bottom = origin.y + (oy + (w + d) * HALF_H + 20) * scale;
-    if (right < 0 || left > view.width || bottom < 0 || top > view.height) return;
-
-    const building = room.phase === 'opening' || room.phase === 'building';
-    const progress = building ? clamp(room.phaseTime / TUNING.build) : 1;
-    const fade = room.phase === 'closing' ? clamp(1 - room.phaseTime / TUNING.close) : 1;
-    const art = this.sprites.room(room.layout, room.theme);
-    ctx.globalAlpha = fade;
-
-    if (progress >= 1) {
-      ctx.drawImage(art.walls, ox - art.originX, oy - art.originY);
-      ctx.drawImage(art.floor, ox - art.originX, oy - art.originY);
-    } else {
-      ctx.globalAlpha = fade * clamp((progress - 0.45) / 0.3);
-      ctx.drawImage(art.walls, ox - art.originX, oy - art.originY);
-      const span = w + d;
-      for (let y = 0; y < d; y += 1) {
-        for (let x = 0; x < w; x += 1) {
-          const local = clamp((progress - ((x + y) / span) * 0.5) / 0.18);
+    // New floor rolls out in a wave from each area's back corner.
+    for (const rect of building.rects) {
+      const span = rect.w + rect.d;
+      for (let y = rect.y; y < rect.y + rect.d; y += 1) {
+        for (let x = rect.x; x < rect.x + rect.w; x += 1) {
+          const wave = ((x - rect.x + (y - rect.y)) / span) * 0.5;
+          const local = clamp((building.progress - wave) / 0.18);
           if (local <= 0) continue;
-          const tile = this.sprites.floorTile(room.theme, (x + y) % 2);
-          const topPoint = project(x, y);
-          ctx.globalAlpha = fade * local;
-          ctx.drawImage(
-            tile.canvas,
-            ox + topPoint.x - 16,
-            Math.round(oy + topPoint.y - (1 - local) * 12),
-          );
+          const style = plan.floor[y * plan.width + x] ?? 0;
+          const { parity, seed } = tileVariant(style, x, y);
+          const tile = this.sprites.floorTile(style, parity, seed);
+          const top = project(x, y);
+          ctx.globalAlpha = local;
+          ctx.drawImage(tile.canvas, top.x - 16, Math.round(top.y - (1 - local) * 12));
         }
       }
-      this.drawDust(room, progress, ox, oy);
+      this.drawDust(rect, building.progress);
     }
-    ctx.globalAlpha = fade;
+    ctx.globalAlpha = 1;
+  }
 
-    // Furniture and people, back to front.
+  private drawDust(rect: Rect, progress: number): void {
+    const ctx = this.context;
+    ctx.fillStyle = this.ink.bubble;
+    for (let index = 0; index < 12; index += 1) {
+      const seed = (index * 9301 + rect.x * 49297 + rect.y * 233) % 233280;
+      const u = rect.x + ((seed % 97) / 97) * rect.w;
+      const v = rect.y + ((seed % 89) / 89) * rect.d;
+      const phase = (progress * 3 + index / 12) % 1;
+      const point = project(u, v, phase * 18);
+      const size = Math.max(1, Math.round(3 * (1 - phase)));
+      ctx.globalAlpha = 0.8 * (1 - phase);
+      ctx.fillRect(Math.round(point.x), Math.round(point.y), size, size);
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  private isVisible(frame: Frame, x: number, y: number): boolean {
+    const { visible } = frame;
+    return x > visible.left && x < visible.right && y > visible.top && y < visible.bottom;
+  }
+
+  /** Furniture and people, back to front. */
+  private drawScene(world: World, frame: Frame): void {
+    const building = this.building(world);
     const items: { depth: number; draw: () => void }[] = [];
-    room.layout.furniture.forEach((item, index) => {
-      const appear = building
-        ? clamp((progress - 0.55 - (index / room.layout.furniture.length) * 0.3) / 0.15)
-        : 1;
+    const furniture = world.floor.furniture;
+    furniture.forEach((item, index) => {
+      const point = project(item.x + 0.5, item.y + 0.5);
+      if (!this.isVisible(frame, point.x, point.y)) return;
+      const rising = building?.rects.some((rect) => inRect(rect, item));
+      const order = index / furniture.length;
+      const appear = rising ? clamp(((building?.progress ?? 1) - 0.55 - order * 0.3) / 0.15) : 1;
       if (appear <= 0) return;
       items.push({
         depth: item.x + item.y,
-        draw: () => this.drawFurniture(world, room, item, ox, oy, appear, fade, view.time),
+        draw: () => this.drawFurniture(world, item, appear, frame.view.time),
       });
     });
     for (const person of world.people.values()) {
-      if (person.room !== room.id || person.stage === 'transit' || person.stage === 'hidden')
-        continue;
+      if (person.stage === 'hidden' || person.stage === 'gone') continue;
+      const point = project(person.x + 0.5, person.y + 0.5);
+      if (!this.isVisible(frame, point.x, point.y)) continue;
       items.push({
         depth: person.x + person.y + 0.05,
-        draw: () => this.drawPerson(world, person, ox, oy, fade, view, scale, origin),
+        draw: () => this.drawPerson(world, person, frame),
       });
     }
     items.sort((a, b) => a.depth - b.depth);
     for (const item of items) item.draw();
-    ctx.globalAlpha = 1;
+    this.context.globalAlpha = 1;
   }
 
-  private drawDust(room: WorldRoom, progress: number, ox: number, oy: number): void {
+  private drawFurniture(world: World, item: Furniture, appear: number, time: number): void {
     const ctx = this.context;
-    ctx.fillStyle = 'rgba(255, 246, 225, 0.75)';
-    for (let index = 0; index < 10; index += 1) {
-      const seed = (index * 9301 + room.order * 49297) % 233280;
-      const u = ((seed % 97) / 97) * room.layout.width;
-      const v = ((seed % 89) / 89) * room.layout.depth;
-      const phase = (progress * 3 + index / 10) % 1;
-      const point = project(u, v, phase * 18);
-      const size = Math.max(1, Math.round(3 * (1 - phase)));
-      ctx.globalAlpha = 0.8 * (1 - phase);
-      ctx.fillRect(Math.round(ox + point.x), Math.round(oy + point.y), size, size);
-    }
-  }
-
-  private drawFurniture(
-    world: World,
-    room: WorldRoom,
-    item: Furniture,
-    ox: number,
-    oy: number,
-    appear: number,
-    fade: number,
-    time: number,
-  ): void {
-    const ctx = this.context;
-    const sprite = this.sprites.furniture(
-      item.kind,
-      item.kind === 'chair' ? room.order : item.variant,
-    );
+    const sprite = this.sprites.furniture(item.kind, item.variant, item.facing);
     const point = project(item.x, item.y);
     const drop = Math.round((1 - easeOutBack(appear)) * 22);
-    const x = ox + point.x - FURNITURE_ANCHOR_X;
-    const y = oy + point.y - FURNITURE_ANCHOR_Y - drop;
-    ctx.globalAlpha = fade * clamp(appear * 1.6);
+    const x = point.x - FURNITURE_ANCHOR_X;
+    const y = point.y - FURNITURE_ANCHOR_Y - drop;
+    ctx.globalAlpha = clamp(appear * 1.6);
     ctx.drawImage(sprite.canvas, x, y);
     if (item.kind === 'desk' && item.deskIndex !== undefined) {
-      const pattern = this.screenFor(world, room, item.deskIndex);
+      const pattern = this.screenFor(world, item.zone, item.deskIndex);
       if (pattern !== 'off') {
         const frame = Math.floor(time * 3) % SCREEN_FRAMES;
         ctx.drawImage(this.sprites.screen(pattern, frame).canvas, x, y);
       }
     }
+    ctx.globalAlpha = 1;
   }
 
-  private screenFor(world: World, room: WorldRoom, deskIndex: number): ScreenPattern {
-    const ownerId = room.deskOwner.get(deskIndex);
+  private screenFor(world: World, teamId: string, deskIndex: number): ScreenPattern {
+    const ownerId = world.teams.get(teamId)?.deskOwner.get(deskIndex);
     const owner = ownerId ? world.people.get(ownerId) : undefined;
     if (!owner) return 'off';
-    const seated =
-      owner.room === room.id && owner.dest?.goal === 'desk' && owner.arrivedAt !== null;
-    if (!seated) return 'saver';
-    if (world.isDozing(owner)) return 'saver';
+    const seated = owner.dest?.goal === 'desk' && owner.arrivedAt !== null;
+    if (!seated || world.isDozing(owner)) return 'saver';
     return screenPatternFor(owner.agent.activity);
   }
 
-  private drawPerson(
-    world: World,
-    person: Person,
-    ox: number,
-    oy: number,
-    fade: number,
-    view: RenderView,
-    scale: number,
-    origin: { x: number; y: number },
-  ): void {
+  private drawPerson(world: World, person: Person, frame: Frame): void {
     const ctx = this.context;
+    const { view, scale, origin } = frame;
     const pose = world.poseOf(person);
-    const view2: AvatarView = person.dir === 'se' || person.dir === 'sw' ? 'front' : 'back';
+    const facing: AvatarView = person.dir === 'se' || person.dir === 'sw' ? 'front' : 'back';
     const mirror = person.dir === 'sw' || person.dir === 'nw';
-    const frame =
+    const animated = pose === 'type' || pose === 'play';
+    const frameIndex =
       pose === 'walk'
         ? Math.floor(person.walkTime * 7) % 4
-        : pose === 'type'
+        : animated
           ? Math.floor(view.time * 5 + person.x) % 2
           : pose === 'wave'
             ? Math.floor(view.time * 4) % 2
@@ -304,20 +316,20 @@ export class Renderer {
     const sprite = this.sprites.avatar(
       {
         look: person.persona.look,
-        view: view2,
+        view: facing,
         pose,
-        frame,
+        frame: frameIndex,
         badge: person.agent.kind === 'subagent',
       },
       mirror,
     );
     const feet = project(person.x + 0.5, person.y + 0.5);
-    const fx = Math.round(ox + feet.x);
-    const fy = Math.round(oy + feet.y);
+    const fx = Math.round(feet.x);
+    const fy = Math.round(feet.y);
     const anchorX = mirror ? AVATAR_W - 1 - AVATAR_ANCHOR_X : AVATAR_ANCHOR_X;
     const seated = pose === 'sit' || pose === 'type' || pose === 'sleep';
 
-    ctx.globalAlpha = fade * person.alpha;
+    ctx.globalAlpha = person.alpha;
     if (!seated) {
       ctx.fillStyle = this.ink.shadow;
       ctx.fillRect(fx - 6, fy - 1, 12, 2);
@@ -326,7 +338,7 @@ export class Renderer {
     const x = fx - anchorX;
     const y = fy - AVATAR_ANCHOR_Y;
     ctx.drawImage(sprite.canvas, x, y);
-    ctx.globalAlpha = fade;
+    ctx.globalAlpha = 1;
 
     const headY = fy - AVATAR_HEAD_TOP + (seated ? 4 : 0);
     this.drawn.push({
@@ -347,15 +359,10 @@ export class Renderer {
     return person.agent.activity;
   }
 
-  private drawStatus(
-    world: World,
-    item: DrawnPerson,
-    view: RenderView,
-    scale: number,
-    origin: { x: number; y: number },
-  ): void {
+  private drawStatus(world: World, item: DrawnPerson, frame: Frame): void {
     const icon = this.statusIcon(world, item.person);
     const ctx = this.context;
+    const { scale, origin, view } = frame;
     const headX = (item.head.x - origin.x) / scale;
     const headY = (item.head.y - origin.y) / scale;
     if (icon) {
@@ -371,14 +378,15 @@ export class Renderer {
     if (item.person.id === view.selectedId) {
       const bob = Math.round(Math.sin(view.time * 4) * 1.5);
       const tipY = Math.round(headY - (icon ? 24 : 6) + bob);
+      const cx = Math.round(headX);
       ctx.fillStyle = this.ink.bubbleBorder;
-      ctx.fillRect(Math.round(headX) - 5, tipY - 7, 11, 5);
-      ctx.fillRect(Math.round(headX) - 3, tipY - 2, 7, 2);
-      ctx.fillRect(Math.round(headX) - 1, tipY, 3, 2);
+      ctx.fillRect(cx - 5, tipY - 7, 11, 5);
+      ctx.fillRect(cx - 3, tipY - 2, 7, 2);
+      ctx.fillRect(cx - 1, tipY, 3, 2);
       ctx.fillStyle = this.ink.arrow;
-      ctx.fillRect(Math.round(headX) - 4, tipY - 6, 9, 3);
-      ctx.fillRect(Math.round(headX) - 2, tipY - 3, 5, 2);
-      ctx.fillRect(Math.round(headX), tipY - 1, 1, 2);
+      ctx.fillRect(cx - 4, tipY - 6, 9, 3);
+      ctx.fillRect(cx - 2, tipY - 3, 5, 2);
+      ctx.fillRect(cx, tipY - 1, 1, 2);
     }
   }
 
@@ -445,10 +453,11 @@ export class Renderer {
     const size = TEXT_SIZE * dpr;
     const padding = 6 * dpr;
     const maxWidth = 200 * dpr;
-    ctx.font = `700 ${size}px ${this.ink.font}`;
+    const font = this.ink.font;
+    ctx.font = `700 ${size}px ${font}`;
     const nameText = `${name}: `;
     const nameWidth = ctx.measureText(nameText).width;
-    ctx.font = `400 ${size}px ${this.ink.font}`;
+    ctx.font = `400 ${size}px ${font}`;
     const lines = wrap(ctx, text, maxWidth, nameWidth);
     const lineHeight = size * 1.25;
     const contentWidth = Math.max(
@@ -469,78 +478,70 @@ export class Renderer {
     ctx.stroke();
     ctx.beginPath();
     ctx.moveTo(centerX - 5 * dpr, y + height - dpr);
-    ctx.lineTo(centerX, y + height + 5 * dpr);
+    ctx.lineTo(centerX, y + height + tail);
     ctx.lineTo(centerX + 5 * dpr, y + height - dpr);
     ctx.fill();
     ctx.stroke();
     ctx.fillRect(centerX - 4 * dpr, y + height - 2 * dpr, 8 * dpr, 2 * dpr);
 
     ctx.textBaseline = 'top';
+    ctx.fillStyle = this.ink.text;
     lines.forEach((line, index) => {
       let lineX = x + padding;
       const lineY = y + padding * 0.8 + index * lineHeight;
       if (index === 0) {
-        ctx.font = `700 ${size}px ${this.ink.font}`;
-        ctx.fillStyle = this.ink.text;
+        ctx.font = `700 ${size}px ${font}`;
         ctx.fillText(nameText, lineX, lineY);
         lineX += nameWidth;
       }
-      ctx.font = `400 ${size}px ${this.ink.font}`;
-      ctx.fillStyle = this.ink.text;
+      ctx.font = `400 ${size}px ${font}`;
       ctx.fillText(line, lineX, lineY);
     });
     return y;
   }
 
-  private drawRoomLabel(
-    world: World,
-    room: WorldRoom,
-    view: RenderView,
-    scale: number,
-    origin: { x: number; y: number },
-    placer: LabelPlacer,
-  ): void {
-    if (room.phase === 'closing') return;
+  /** A floating plate over each area: team plates carry a head count, shared ones are quieter. */
+  private drawZoneLabel(world: World, zone: Zone, frame: Frame, placer: LabelPlacer): void {
+    const { view, scale, origin } = frame;
+    const team = zone.kind === 'team';
+    if (!team && scale / view.dpr < SHARED_PLATES_FROM) return;
+    // Team plates float over the back edge, clear of the desks; shared ones over their middle.
+    const anchorWorld = team
+      ? project(zone.rect.x + zone.rect.w / 2, zone.rect.y + 1, PLATE_HEIGHT)
+      : project(zone.rect.x + zone.rect.w / 2, zone.rect.y + zone.rect.d / 2, 12);
+    if (!this.isVisible(frame, anchorWorld.x, anchorWorld.y)) return;
     const ctx = this.context;
     const dpr = view.dpr;
-    const anchor = {
-      x: origin.x + Math.round(room.origin.x) * scale,
-      y: origin.y + (Math.round(room.origin.y) - WALL_HEIGHT - 8) * scale,
-    };
-    if (
-      anchor.x < -200 ||
-      anchor.x > view.width + 200 ||
-      anchor.y < -40 ||
-      anchor.y > view.height + 40
-    )
-      return;
-    const name = room.id === LOUNGE_ID ? view.loungeName : room.name;
-    const count = [...world.people.values()].filter(
-      (person) => person.home === room.id && !person.departing,
-    ).length;
-    const renovating = room.phase === 'evacuating' || room.phase === 'building';
+    const anchor = { x: origin.x + anchorWorld.x * scale, y: origin.y + anchorWorld.y * scale };
+    const name =
+      zone.kind === 'team' ? (world.teams.get(zone.id)?.name ?? '') : view.zoneNames[zone.kind];
+    if (!name) return;
+    const count = team
+      ? [...world.people.values()].filter((person) => person.home === zone.id && !person.departing)
+          .length
+      : 0;
+    const renovating = team && world.teamPhase(zone.id) === 'renovating';
     const size = TEXT_SIZE * dpr;
-    ctx.font = `700 ${size}px ${this.ink.font}`;
+    ctx.font = `${team ? 700 : 500} ${size}px ${this.ink.font}`;
     const nameWidth = ctx.measureText(name).width;
-    const countText = room.id === LOUNGE_ID ? '' : String(count);
+    const countText = team ? String(count) : '';
     const countWidth = countText ? ctx.measureText(countText).width + 18 * dpr : 0;
     const tag = renovating ? view.renovatingLabel : '';
     const tagWidth = tag ? ctx.measureText(tag).width + 14 * dpr : 0;
     const padding = 8 * dpr;
     const width = padding * 2 + nameWidth + countWidth + tagWidth;
-    const height = 24 * dpr;
+    const height = (team ? 24 : 22) * dpr;
     const x = Math.round(onScreen(anchor.x - width / 2, width, view));
     const y = Math.round(placer.place(x, anchor.y - height, width, height));
 
     ctx.fillStyle = this.ink.plate;
     ctx.strokeStyle = renovating ? this.ink.renovate : this.ink.plateBorder;
-    ctx.lineWidth = 2 * dpr;
+    ctx.lineWidth = (team ? 2 : 1) * dpr;
     roundRect(ctx, x, y, width, height, 6 * dpr);
     ctx.fill();
     ctx.stroke();
     ctx.textBaseline = 'middle';
-    ctx.font = `700 ${size}px ${this.ink.font}`;
-    ctx.fillStyle = this.ink.plateText;
+    ctx.fillStyle = team ? this.ink.plateText : this.ink.plateMuted;
     ctx.fillText(name, x + padding, y + height / 2 + dpr);
     let cursor = x + padding + nameWidth;
     if (countText) {

@@ -145,10 +145,17 @@ export function App() {
             <div className="min-h-0 flex-1 overflow-y-auto">{panel}</div>
           </aside>
           <div className="pointer-events-none absolute bottom-4 left-4 flex w-[min(420px,calc(100%-400px))] flex-col gap-3">
-            <ActivityLog log={hud.log} now={now} />
+            {/* The card tells the selected story; the log would only crowd it. */}
+            {!selected ? <ActivityLog log={hud.log} now={now} /> : null}
             {selected ? (
               <div className="pointer-events-auto">
-                <PersonCard person={selected} now={now} onClose={() => engine.select(null)} />
+                <PersonCard
+                  person={selected}
+                  people={hud.people}
+                  now={now}
+                  onClose={() => engine.select(null)}
+                  onFocus={focus}
+                />
               </div>
             ) : null}
             <div ref={footerRef} className="flex">
@@ -158,10 +165,16 @@ export function App() {
         </>
       ) : (
         <div className="pointer-events-none absolute inset-x-0 bottom-0 flex flex-col gap-2 p-2 pb-[max(0.5rem,env(safe-area-inset-bottom))]">
-          {!sheetOpen ? <ActivityLog log={hud.log.slice(0, 1)} now={now} /> : null}
+          {!sheetOpen && !selected ? <ActivityLog log={hud.log.slice(0, 1)} now={now} /> : null}
           {selected && !sheetOpen ? (
             <div className="pointer-events-auto">
-              <PersonCard person={selected} now={now} onClose={() => engine.select(null)} />
+              <PersonCard
+                person={selected}
+                people={hud.people}
+                now={now}
+                onClose={() => engine.select(null)}
+                onFocus={focus}
+              />
             </div>
           ) : null}
           {sheetOpen ? (

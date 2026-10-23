@@ -14,7 +14,12 @@ import {
 } from './registry.ts';
 import { buildRooms, projectRoot, transcriptFolderName } from './rooms.ts';
 import { TranscriptTail } from './tail.ts';
-import { transcriptActivity, type TranscriptState } from './transcript.ts';
+import {
+  emptyInsight,
+  transcriptActivity,
+  transcriptInsight,
+  type TranscriptState,
+} from './transcript.ts';
 
 const TICK_MS = 1000;
 /** Headless runs (`claude -p`, SDK) have no registry entry; they are found by recent writes. */
@@ -291,6 +296,7 @@ export class ClaudeSource extends PollingSource {
         ...activity,
         activitySince: this.since(session.sessionId, activity, lastEventAt, now),
         startedAt: session.startedAt,
+        insight: session.tail ? transcriptInsight(session.tail.state) : emptyInsight(),
       });
       for (const sub of session.subagents.values()) {
         const id = `${session.sessionId}/${sub.agentId}`;
@@ -305,6 +311,7 @@ export class ClaudeSource extends PollingSource {
           ...subActivity,
           activitySince: this.since(id, subActivity, sub.tail.state.lastEventAt || now, now),
           startedAt: sub.startedAt,
+          insight: transcriptInsight(sub.tail.state),
         });
       }
     }

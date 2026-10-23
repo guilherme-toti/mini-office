@@ -3,74 +3,48 @@ import { hex, type Color } from './pixmap.ts';
 /** The pixel-art palette. UI colors live in CSS tokens; these are paint for the canvas only. */
 export const OUTLINE = hex('#1d1a2b');
 
-export interface RoomTheme {
-  floorA: Color;
-  floorB: Color;
-  floorStyle: 'checker' | 'planks' | 'carpet';
-  wall: Color;
-  wallTrim: Color;
-  slab: Color;
+export interface FloorStyle {
+  a: Color;
+  b: Color;
+  pattern: 'checker' | 'planks' | 'carpet' | 'grass';
 }
 
-export const ROOM_THEMES: readonly RoomTheme[] = [
-  {
-    floorA: hex('#d9c7a3'),
-    floorB: hex('#cfbb94'),
-    floorStyle: 'planks',
-    wall: hex('#b9d2e8'),
-    wallTrim: hex('#7d9cbb'),
-    slab: hex('#8f7a5a'),
-  },
-  {
-    floorA: hex('#c8d4dc'),
-    floorB: hex('#b9c6cf'),
-    floorStyle: 'checker',
-    wall: hex('#f1dcc0'),
-    wallTrim: hex('#c4a27c'),
-    slab: hex('#7c8a96'),
-  },
-  {
-    floorA: hex('#8fa7c9'),
-    floorB: hex('#86a0c3'),
-    floorStyle: 'carpet',
-    wall: hex('#e8e4d8'),
-    wallTrim: hex('#a9a291'),
-    slab: hex('#5a6e8c'),
-  },
-  {
-    floorA: hex('#c9b3d6'),
-    floorB: hex('#bea6cc'),
-    floorStyle: 'carpet',
-    wall: hex('#f5eaf0'),
-    wallTrim: hex('#bfa3b4'),
-    slab: hex('#7d6a8c'),
-  },
-  {
-    floorA: hex('#b8cfa8'),
-    floorB: hex('#aec59d'),
-    floorStyle: 'checker',
-    wall: hex('#f3ecd3'),
-    wallTrim: hex('#c3b78f'),
-    slab: hex('#6f8560'),
-  },
-  {
-    floorA: hex('#c49a74'),
-    floorB: hex('#b88f69'),
-    floorStyle: 'planks',
-    wall: hex('#d7e7df'),
-    wallTrim: hex('#8fb3a3'),
-    slab: hex('#7a5a40'),
-  },
+/** Every floor in the office. Zones pick theirs by index, so the bake stays a byte per tile. */
+export const FLOOR_STYLES: readonly FloorStyle[] = [
+  { a: hex('#e6d9bf'), b: hex('#ddcfb2'), pattern: 'planks' },
+  { a: hex('#f2efe6'), b: hex('#2f3a4f'), pattern: 'checker' },
+  { a: hex('#e8a87c'), b: hex('#de9c6f'), pattern: 'carpet' },
+  { a: hex('#8a78c9'), b: hex('#8070bf'), pattern: 'carpet' },
+  { a: hex('#b9c3cf'), b: hex('#aeb9c6'), pattern: 'carpet' },
+  { a: hex('#7cc26a'), b: hex('#6fb65e'), pattern: 'grass' },
+  { a: hex('#b07a4a'), b: hex('#a6703f'), pattern: 'planks' },
+  { a: hex('#8fa7c9'), b: hex('#86a0c3'), pattern: 'carpet' },
+  { a: hex('#c9b3d6'), b: hex('#bea6cc'), pattern: 'carpet' },
+  { a: hex('#b8cfa8'), b: hex('#aec59d'), pattern: 'carpet' },
+  { a: hex('#d6c08f'), b: hex('#ccb684'), pattern: 'carpet' },
+  { a: hex('#9fc9c3'), b: hex('#93bfb9'), pattern: 'carpet' },
+  { a: hex('#d9a3a3'), b: hex('#cf9898'), pattern: 'carpet' },
 ];
 
-export const LOUNGE_THEME: RoomTheme = {
-  floorA: hex('#f2efe6'),
-  floorB: hex('#2f3a4f'),
-  floorStyle: 'checker',
-  wall: hex('#ffd9a8'),
-  wallTrim: hex('#d69a5c'),
-  slab: hex('#5c4a3a'),
-};
+export const FLOOR = {
+  corridor: 0,
+  kitchen: 1,
+  lounge: 2,
+  games: 3,
+  meeting: 4,
+  grass: 5,
+  deck: 6,
+  /** Team carpets start here; each team gets one by hash. */
+  teams: 7,
+} as const;
+
+export const TEAM_FLOOR_COUNT = FLOOR_STYLES.length - FLOOR.teams;
+
+export const WALLS = {
+  wall: hex('#cfe0ee'),
+  trim: hex('#8aa6c2'),
+  slab: hex('#7d6a58'),
+} as const;
 
 export const ART = {
   wood: hex('#b07a4a'),

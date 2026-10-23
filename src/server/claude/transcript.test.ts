@@ -5,6 +5,7 @@ import {
   applyTranscriptLine,
   emptyTranscriptState,
   transcriptActivity,
+  transcriptInsight,
   type TranscriptState,
 } from './transcript.ts';
 
@@ -143,5 +144,60 @@ describe('rooms', () => {
   it('disambiguates rooms that share a folder name', () => {
     const rooms = buildRooms(['/a/web', '/b/web', '/a/api'], '/home');
     expect(rooms.map((room) => room.name).sort()).toEqual(['a/web', 'api', 'b/web']);
+  });
+});
+
+describe('agent insight', () => {
+  const said = (text: string) => ({
+    type: 'assistant',
+    message: {
+      model: 'claude-opus-5-5',
+      stop_reason: 'tool_use',
+      content: [{ type: 'text', text }],
+    },
+  });
+  const failed = (id: string) => ({
+    type: 'user',
+    message: {
+      content: [{ type: 'tool_result', tool_use_id: id, is_error: true, content: 'boom' }],
+    },
+  });
+
+  it('tells the story: the request, what it said, its steps and how they went', () => {
+    const state = feed([
+      { ...prompt('Fix the flaky invoice tests'), gitBranch: 'fix/invoices' },
+      said('Let me run them first.'),
+      toolUse('t1', 'Bash', { command: 'pnpm test', description: 'Run the tests' }),
+      failed('t1'),
+      toolUse('t2', 'Edit', { file_path: '/repo/src/invoice.ts' }),
+      toolResult('t2'),
+      toolUse('t3', 'Read', { file_path: '/repo/src/totals.ts' }),
+    ]);
+    const insight = transcriptInsight(state);
+    expect(insight.prompt).toBe('Fix the flaky invoice tests');
+    expect(insight.said).toBe('Let me run them first.');
+    expect(insight.branch).toBe('fix/invoices');
+    expect(insight.model).toBe('claude-opus-5-5');
+    expect(insight.steps.map((step) => [step.activity, step.result])).toEqual([
+      ['reading', 'running'],
+      ['editing', 'ok'],
+      ['running', 'failed'],
+    ]);
+    expect(insight.files).toEqual(['invoice.ts']);
+    expect(insight.counts).toEqual({ steps: 3, commands: 1, failures: 1 });
+  });
+
+  it('skips injected context when looking for the last request', () => {
+    const state = feed([
+      prompt('Make the dashboard faster'),
+      prompt('<local-command-stdout>Set effort level</local-command-stdout>'),
+      prompt('[Image: original 2280x1260]'),
+    ]);
+    expect(transcriptInsight(state).prompt).toBe('Make the dashboard faster');
+  });
+
+  it('masks secrets in what it shows', () => {
+    const state = feed([prompt('Use key sk_live_51HxQ2eKa9b8c7d6e5f4g3h2 for the test')]);
+    expect(transcriptInsight(state).prompt).toBe('Use key ••• for the test');
   });
 });

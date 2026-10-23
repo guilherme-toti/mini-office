@@ -1,8 +1,14 @@
 import { open, stat } from 'node:fs/promises';
 import { applyTranscriptLine, emptyTranscriptState, type TranscriptState } from './transcript.ts';
 
-/** How much of an existing transcript is read on first sight: enough for the current turn. */
+/** How much of an existing transcript is read on first sight, before widening. */
 const INITIAL_TAIL_BYTES = 512 * 1024;
+/**
+ * Screenshots and other tool output can be megabytes per line, so the first look widens until
+ * it finds the latest request and a few steps, up to this much.
+ */
+const MAX_FIRST_LOOK_BYTES = 16 * 1024 * 1024;
+const ENOUGH_STEPS = 4;
 const NEWLINE = 0x0a;
 
 /** Follows one JSONL transcript, reading only the bytes appended since the last poll. */
@@ -29,22 +35,43 @@ export class TranscriptTail {
     }
     if (size < this.offset) this.reset();
     if (size === this.offset) return;
-
-    const firstLook = this.offset < 0;
-    const start = firstLook ? Math.max(0, size - INITIAL_TAIL_BYTES) : this.offset;
-    const chunk = await this.read(start, size);
+    if (this.offset < 0) {
+      await this.firstLook(size, now);
+      return;
+    }
+    const chunk = await this.read(this.offset, size);
     if (!chunk) return;
+    this.offset += chunk.length;
+    this.state = this.apply(this.state, Buffer.concat([this.remainder, chunk]), now);
+  }
 
-    let bytes = Buffer.concat([this.remainder, chunk]);
-    // Starting mid-file lands inside a line; drop that fragment.
-    if (firstLook && start > 0) bytes = bytes.subarray(bytes.indexOf(NEWLINE) + 1);
+  private async firstLook(size: number, now: number): Promise<void> {
+    for (let window = INITIAL_TAIL_BYTES; ; window *= 4) {
+      const start = Math.max(0, size - window);
+      const chunk = await this.read(start, size);
+      if (!chunk) return;
+      // Starting mid-file lands inside a line; drop that fragment.
+      const bytes = start > 0 ? chunk.subarray(chunk.indexOf(NEWLINE) + 1) : chunk;
+      const state = this.apply(emptyTranscriptState(), bytes, now);
+      const enough = state.prompt !== null && state.steps.length >= ENOUGH_STEPS;
+      if (enough || start === 0 || window >= MAX_FIRST_LOOK_BYTES) {
+        this.state = state;
+        this.offset = start + chunk.length;
+        return;
+      }
+    }
+  }
+
+  /** Applies every complete line and keeps the unfinished tail for next time. */
+  private apply(state: TranscriptState, bytes: Buffer, now: number): TranscriptState {
     const lastNewline = bytes.lastIndexOf(NEWLINE);
     this.remainder = Buffer.from(bytes.subarray(lastNewline + 1));
-    this.offset = start + chunk.length;
-    if (lastNewline < 0) return;
+    if (lastNewline < 0) return state;
+    let next = state;
     for (const line of bytes.subarray(0, lastNewline).toString('utf8').split('\n')) {
-      this.state = applyTranscriptLine(this.state, line, now);
+      next = applyTranscriptLine(next, line, now);
     }
+    return next;
   }
 
   private reset(): void {

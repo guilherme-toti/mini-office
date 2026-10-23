@@ -1,25 +1,36 @@
 import type { AgentSnapshot, OfficeSnapshot } from '../../../shared/protocol.ts';
-import { between, createRandom, hashString, pick } from '../../../shared/random.ts';
+import { between, createRandom, pick } from '../../../shared/random.ts';
 import type { Messages } from '../../i18n/index.ts';
 import { format } from '../../i18n/index.ts';
 import type { AvatarPose } from '../gfx/avatar-art.ts';
-import { LOUNGE_THEME, ROOM_THEMES } from '../gfx/palette.ts';
-import { packOffice, roomBounds } from '../layout/office-layout.ts';
+import { buildFloor, COMMONS_W, teamTierFor, type TeamRequest } from '../layout/floor-plan.ts';
 import { findPath } from '../layout/pathfinding.ts';
-import { loungeLayout, loungeTierFor, workRoomLayout, workTierFor } from '../layout/room-layout.ts';
-import { isWalkable, lookDir, sameTile, stepDir, type Spot, type Tile } from '../layout/types.ts';
+import {
+  inRect,
+  isWalkable,
+  lookDir,
+  sameRect,
+  sameTile,
+  stepDir,
+  type Desk,
+  type FloorPlan,
+  type Spot,
+  type SpotKind,
+  type Tile,
+  type Zone,
+} from '../layout/types.ts';
 import { createPersona, distinctName } from './persona.ts';
 import { TUNING } from './tuning.ts';
-import {
-  LOUNGE_ID,
-  type Destination,
-  type GoalKind,
-  type LogEntry,
-  type LogKind,
-  type LoungeReason,
-  type Person,
-  type ScriptKind,
-  type WorldRoom,
+import type {
+  BreakReason,
+  Destination,
+  GoalKind,
+  LogEntry,
+  LogKind,
+  Person,
+  Renovation,
+  ScriptKind,
+  Team,
 } from './types.ts';
 
 type Lines = readonly string[];
@@ -28,12 +39,50 @@ interface Goal {
   kind: GoalKind;
   partner: string | null;
   script: ScriptKind | null;
-  reason: LoungeReason | null;
+  reason: BreakReason | null;
 }
 
 const DOOR_STEP = 0.6;
 const MAX_BUBBLES = 3;
 const TASK_MAX = 42;
+
+const KITCHEN_SPOTS: readonly SpotKind[] = ['coffee', 'cooler', 'vending'];
+type Hangout = 'games' | 'terrace' | 'lounge';
+const HANGOUT_SPOTS: Record<Hangout, readonly SpotKind[]> = {
+  games: ['arcade', 'tv', 'pingpong'],
+  terrace: ['parasol', 'bench'],
+  lounge: ['sofa'],
+};
+/** Where people drift to, by why they are on a break. Idle agents mostly go play. */
+const HANGOUT_WEIGHTS: Record<BreakReason, readonly (readonly [Hangout, number])[]> = {
+  break: [
+    ['games', 0.5],
+    ['terrace', 0.3],
+    ['lounge', 0.2],
+  ],
+  coffee: [
+    ['terrace', 0.4],
+    ['lounge', 0.4],
+    ['games', 0.2],
+  ],
+  renovation: [
+    ['lounge', 0.4],
+    ['terrace', 0.4],
+    ['games', 0.2],
+  ],
+};
+const SPOT_POSE: Record<SpotKind, AvatarPose> = {
+  coffee: 'drink',
+  cooler: 'drink',
+  vending: 'stand',
+  arcade: 'play',
+  pingpong: 'play',
+  tv: 'type',
+  sofa: 'sit',
+  meeting: 'sit',
+  parasol: 'sit',
+  bench: 'sit',
+};
 
 export interface WorldOptions {
   say: Messages['say'];
@@ -42,60 +91,39 @@ export interface WorldOptions {
 
 /**
  * The office simulation: it reconciles snapshots from the server with the people on screen and
- * moves everyone around like a small, believable workplace.
+ * moves everyone around one shared floor like a small, believable workplace.
  */
 export class World {
-  readonly rooms = new Map<string, WorldRoom>();
+  floor: FloorPlan = buildFloor([]);
+  /** Bumped whenever the floor plan is replaced, so art and camera can follow. */
+  floorVersion = 0;
+  readonly teams = new Map<string, Team>();
   readonly people = new Map<string, Person>();
+  renovation: Renovation | null = null;
   readonly log: LogEntry[] = [];
   time = 0;
-  aspect = 1.6;
-  /** Bumped whenever room sizes or positions change, so the camera can refit. */
-  layoutVersion = 0;
 
   private readonly say: Messages['say'];
   private readonly random: () => number;
   private initialized = false;
   private order = 0;
   private logId = 0;
-  private layoutDirty = true;
-  private initializedLayout = false;
   private now = 0;
+  private pendingPlan: FloorPlan | null = null;
   private readonly pendingSpeech: { id: string; text: string; at: number }[] = [];
-  /** One conversation starts at a time, so the lounge stays readable. */
-  private nextLoungeChatAt = 0;
+  /** One conversation starts at a time, so the shared spaces stay readable. */
+  private nextChatAt = 0;
 
   constructor(options: WorldOptions) {
     this.say = options.say;
     this.random = createRandom(options.seed ?? 1);
-    const layout = loungeLayout(0);
-    this.rooms.set(LOUNGE_ID, {
-      id: LOUNGE_ID,
-      name: '',
-      kind: 'lounge',
-      theme: LOUNGE_THEME,
-      layout,
-      phase: 'open',
-      phaseTime: 0,
-      pendingTier: null,
-      origin: { x: 0, y: 0 },
-      target: { x: 0, y: 0 },
-      order: -1,
-      emptyFor: 0,
-      shrinkFor: 0,
-      deskOwner: new Map(),
-    });
   }
 
   // ─── Snapshots ────────────────────────────────────────────────────────────────────────────
 
   applySnapshot(snapshot: OfficeSnapshot, now: number): void {
     this.now = now;
-    const members = new Map<string, number>();
-    for (const agent of snapshot.agents)
-      members.set(agent.roomId, (members.get(agent.roomId) ?? 0) + 1);
-    for (const room of snapshot.rooms)
-      this.ensureRoom(room.id, room.name, members.get(room.id) ?? 1);
+    for (const room of snapshot.rooms) this.ensureTeam(room.id, room.name);
 
     const seen = new Set<string>();
     for (const agent of snapshot.agents) {
@@ -116,45 +144,40 @@ export class World {
 
     if (!this.initialized) {
       this.initialized = true;
+      this.replaceFloor(buildFloor(this.desiredTeams()));
       for (const person of this.people.values()) this.placeInstantly(person);
     }
   }
 
-  /** Drops everyone and every room, e.g. when switching between live and demo. */
+  /** Drops everyone and every team, e.g. when switching between live and demo. */
   reset(): void {
-    for (const id of [...this.rooms.keys()]) if (id !== LOUNGE_ID) this.rooms.delete(id);
+    this.teams.clear();
     this.people.clear();
     this.log.length = 0;
     this.pendingSpeech.length = 0;
+    this.renovation = null;
+    this.pendingPlan = null;
     this.initialized = false;
-    this.layoutDirty = true;
+    this.replaceFloor(buildFloor([]));
   }
 
-  private ensureRoom(id: string, name: string, members: number): void {
-    const existing = this.rooms.get(id);
+  private ensureTeam(id: string, name: string): void {
+    const existing = this.teams.get(id);
     if (existing) {
       existing.name = name;
+      existing.emptyFor = 0;
       return;
     }
-    const theme = ROOM_THEMES[hashString(id) % ROOM_THEMES.length] ?? LOUNGE_THEME;
     this.order += 1;
-    this.rooms.set(id, {
+    this.teams.set(id, {
       id,
       name,
-      kind: 'work',
-      theme,
-      layout: workRoomLayout(workTierFor(Math.max(1, members)), id),
-      phase: this.initialized ? 'opening' : 'open',
-      phaseTime: 0,
-      pendingTier: null,
-      origin: { x: 0, y: 0 },
-      target: { x: Number.NaN, y: Number.NaN },
       order: this.order,
+      tier: -1,
       emptyFor: 0,
       shrinkFor: 0,
       deskOwner: new Map(),
     });
-    this.layoutDirty = true;
     if (this.initialized) this.addLog('opened', { room: name });
   }
 
@@ -167,7 +190,6 @@ export class World {
       name: distinctName(persona, agent.id, taken),
       agent,
       home: agent.roomId,
-      room: null,
       x: 0,
       y: 0,
       dir: 'se',
@@ -186,31 +208,33 @@ export class World {
       briefed: agent.kind === 'session' || !this.initialized,
       reported: agent.kind === 'session',
       script: null,
-      lounge: null,
+      visit: null,
       lookAt: null,
       nextChatAt: this.time + between(this.random, 3, TUNING.chatGapMax),
       nextCheckInAt: 0,
       sipUntil: 0,
       brainTimer: this.random() * TUNING.brainEvery,
       lastActivity: agent.activity,
+      spawnedAt: this.time,
+      shown: false,
     });
   }
 
   private placeInstantly(person: Person): void {
     const goal = this.decide(person);
     this.adoptGoal(person, goal, true);
-    if (person.lounge) person.lounge.phase = 'hangout';
+    if (person.visit) person.visit.phase = 'hangout';
     const dest = this.resolve(person, goal);
     if (!dest || dest.goal === 'exit') return;
     person.dest = dest;
-    person.room = dest.room;
     person.x = dest.tile.x;
     person.y = dest.tile.y;
     person.dir = dest.facing;
     person.stage = 'present';
+    person.shown = true;
     person.alpha = 1;
     person.arrivedAt = this.time - 5;
-    if (person.lounge) person.lounge.until = this.time + between(this.random, 4, TUNING.hangoutMax);
+    if (person.visit) person.visit.until = this.time + between(this.random, 4, TUNING.hangoutMax);
   }
 
   // ─── Simulation step ──────────────────────────────────────────────────────────────────────
@@ -218,12 +242,11 @@ export class World {
   tick(dt: number, now: number): void {
     this.time += dt;
     this.now = now;
-    this.updateRooms(dt);
+    this.updateTeams(dt);
+    this.updateRenovation(dt);
     for (const person of [...this.people.values()]) this.updatePerson(person, dt);
     this.updateChatter();
     this.flushSpeech();
-    if (this.layoutDirty) this.relayout();
-    this.easeRooms(dt);
   }
 
   private updatePerson(person: Person, dt: number): void {
@@ -242,16 +265,14 @@ export class World {
     if (person.stage === 'gone') {
       this.releaseDesks(person.id);
       this.people.delete(person.id);
-      if (person.room !== null || person.alpha > 0) {
-        this.addLog('left', { name: person.name });
-      }
+      if (person.shown) this.addLog('left', { name: person.name });
     }
   }
 
   private releaseDesks(personId: string): void {
-    for (const room of this.rooms.values()) {
-      for (const [index, owner] of room.deskOwner) {
-        if (owner === personId) room.deskOwner.delete(index);
+    for (const team of this.teams.values()) {
+      for (const [index, owner] of team.deskOwner) {
+        if (owner === personId) team.deskOwner.delete(index);
       }
     }
   }
@@ -264,7 +285,7 @@ export class World {
       return;
     }
     this.noticeActivityChange(person);
-    this.advanceLounge(person);
+    this.advanceVisit(person);
 
     const goal = this.decide(person);
     const key = goalKey(goal);
@@ -296,15 +317,20 @@ export class World {
       }
       return goal('exit');
     }
-    const home = this.rooms.get(person.home);
-    if (!home || home.phase !== 'open') return goal('lounge', { reason: 'renovation' });
+    if (!this.hasDesks(person.home)) return goal('commons', { reason: 'renovation' });
 
+    // New helpers get briefed in the meeting room; whoever called them joins them there.
     if (!person.briefed) {
-      if (parentId && this.isAvailable(parentId) && this.time - person.goalSince < 12) {
-        return goal('visit', { partner: parentId, script: 'brief' });
+      if (parentId && this.isAvailable(parentId) && this.time - person.spawnedAt < 30) {
+        return goal('meeting', { partner: parentId, script: 'brief' });
       }
       person.briefed = true;
     }
+    const newcomer = [...this.people.values()].find(
+      (other) =>
+        other.agent.parentId === person.id && !other.briefed && other.goalKey.startsWith('meeting'),
+    );
+    if (newcomer) return goal('meeting', { partner: newcomer.id });
     if (person.script?.kind === 'checkIn') {
       return goal('visit', { partner: person.script.partner, script: 'checkIn' });
     }
@@ -313,9 +339,9 @@ export class World {
     switch (agent.activity) {
       case 'waiting':
         if (age < TUNING.waitAtDeskMs || age > TUNING.dozeAfterMs) return goal('desk');
-        return goal('lounge', { reason: 'break' });
+        return goal('commons', { reason: 'break' });
       case 'running':
-        return age > TUNING.longCommandMs ? goal('lounge', { reason: 'coffee' }) : goal('desk');
+        return age > TUNING.longCommandMs ? goal('commons', { reason: 'coffee' }) : goal('desk');
       case 'delegating': {
         if (age < TUNING.checkInAfterMs || this.time < person.nextCheckInAt) return goal('desk');
         const helper = [...this.people.values()].find(
@@ -330,8 +356,9 @@ export class World {
   }
 
   private isUrgent(person: Person, goal: Goal): boolean {
-    if (goal.kind === 'exit' || goal.kind === 'visit' || goal.reason === 'renovation') return true;
-    return person.goalKey.startsWith('lounge') && goal.kind === 'desk';
+    if (goal.kind === 'exit' || goal.kind === 'visit' || goal.kind === 'meeting') return true;
+    if (goal.reason === 'renovation') return true;
+    return person.goalKey.startsWith('commons') && goal.kind === 'desk';
   }
 
   private adoptGoal(person: Person, goal: Goal, silent: boolean): void {
@@ -341,8 +368,8 @@ export class World {
     person.hurry = false;
     person.dest = null;
     person.arrivedAt = null;
-    person.lounge =
-      goal.kind === 'lounge' && goal.reason
+    person.visit =
+      goal.kind === 'commons' && goal.reason
         ? {
             reason: goal.reason,
             phase: goal.reason === 'renovation' ? 'hangout' : 'coffee',
@@ -354,13 +381,13 @@ export class World {
     }
     if (silent) return;
 
-    if (goal.kind === 'lounge' && goal.reason === 'break' && this.random() < 0.6) {
+    if (goal.kind === 'commons' && goal.reason === 'break' && this.random() < 0.6) {
       this.speak(person, this.say.breakStart);
-    } else if (goal.kind === 'lounge' && goal.reason === 'coffee') {
+    } else if (goal.kind === 'commons' && goal.reason === 'coffee') {
       this.speak(person, this.say.longCommand);
     } else if (
       goal.kind === 'desk' &&
-      previous.startsWith('lounge') &&
+      previous.startsWith('commons') &&
       person.agent.activity !== 'waiting'
     ) {
       person.hurry = true;
@@ -379,9 +406,9 @@ export class World {
     }
   }
 
-  private advanceLounge(person: Person): void {
-    const visit = person.lounge;
-    if (!visit || person.arrivedAt === null || person.dest?.room !== LOUNGE_ID) return;
+  private advanceVisit(person: Person): void {
+    const visit = person.visit;
+    if (!visit || person.arrivedAt === null || person.dest?.goal !== 'commons') return;
     if (this.time < visit.until) {
       const standing = visit.phase === 'hangout' && person.dest.pose === 'stand';
       if (standing && this.time > person.sipUntil + 6 && this.random() < 0.05) {
@@ -389,11 +416,8 @@ export class World {
       }
       return;
     }
-    if (visit.phase === 'coffee') {
-      visit.phase = 'hangout';
-    } else if (this.random() < 0.3 && visit.reason !== 'renovation') {
-      visit.phase = 'coffee';
-    }
+    if (visit.phase === 'coffee') visit.phase = 'hangout';
+    else if (this.random() < 0.25 && visit.reason !== 'renovation') visit.phase = 'coffee';
     visit.until = Number.POSITIVE_INFINITY;
     person.dest = null;
     person.arrivedAt = null;
@@ -405,34 +429,33 @@ export class World {
     switch (goal.kind) {
       case 'desk':
         return this.deskDestination(person);
-      case 'lounge':
-        if (person.dest?.goal === 'lounge') return person.dest;
-        return this.loungeDestination(person);
+      case 'commons':
+        if (person.dest?.goal === 'commons' && this.isStillFree(person.dest.tile)) {
+          return person.dest;
+        }
+        return this.commonsDestination(person);
       case 'visit':
         return goal.partner ? this.visitDestination(person, goal.partner) : null;
-      case 'exit': {
-        const room = this.rooms.get(person.room ?? person.home);
-        if (!room) return null;
-        return {
-          goal: 'exit',
-          room: room.id,
-          tile: room.layout.door,
-          facing: 'nw',
-          pose: 'stand',
-          partner: null,
-        };
-      }
+      case 'meeting':
+        if (person.dest?.goal === 'meeting' && this.isStillFree(person.dest.tile)) {
+          return person.dest;
+        }
+        return goal.partner ? this.meetingDestination(person, goal.partner) : null;
+      case 'exit':
+        return { goal: 'exit', tile: this.floor.door, facing: 'nw', pose: 'stand', partner: null };
     }
   }
 
+  /** A kept destination is still usable after a floor swap. */
+  private isStillFree(tile: Tile): boolean {
+    return isWalkable(this.floor, tile) && !this.inRenovation(tile);
+  }
+
   private deskDestination(person: Person): Destination | null {
-    const room = this.rooms.get(person.home);
-    if (!room) return null;
-    const desk = this.claimDesk(room, person.id);
-    if (!desk) return this.loungeDestination(person);
+    const desk = this.claimDesk(person);
+    if (!desk) return this.commonsDestination(person);
     return {
       goal: 'desk',
-      room: room.id,
       tile: desk.seat,
       facing: desk.facing,
       pose: deskPose(person, this.now),
@@ -440,71 +463,100 @@ export class World {
     };
   }
 
-  private claimDesk(room: WorldRoom, personId: string) {
-    for (const [index, owner] of room.deskOwner) {
-      if (owner === personId) {
-        const desk = room.layout.desks[index];
-        if (desk) return desk;
-        room.deskOwner.delete(index);
-      }
+  private zoneOfTeam(teamId: string): Zone | undefined {
+    return this.floor.zones.find((zone) => zone.kind === 'team' && zone.id === teamId);
+  }
+
+  private hasDesks(teamId: string): boolean {
+    return this.zoneOfTeam(teamId) !== undefined && !this.renovation?.zones.has(teamId);
+  }
+
+  private claimDesk(person: Person): Desk | null {
+    const team = this.teams.get(person.home);
+    const zone = this.zoneOfTeam(person.home);
+    if (!team || !zone) return null;
+    for (const [index, owner] of team.deskOwner) {
+      if (owner !== person.id) continue;
+      const desk = zone.desks[index];
+      if (desk) return desk;
+      team.deskOwner.delete(index);
     }
-    const free = room.layout.desks.find((desk) => !room.deskOwner.has(desk.index));
+    const free = zone.desks.find((desk) => !team.deskOwner.has(desk.index));
     if (!free) return null;
-    room.deskOwner.set(free.index, personId);
+    team.deskOwner.set(free.index, person.id);
     return free;
   }
 
-  private loungeDestination(person: Person): Destination | null {
-    const lounge = this.rooms.get(LOUNGE_ID);
-    if (!lounge) return null;
-    const wantsCoffee = person.lounge?.phase === 'coffee';
-    const free = lounge.layout.spots.filter(
-      (spot) => !this.isTaken(LOUNGE_ID, spot.tile, person.id),
+  private freeSpots(kinds: readonly SpotKind[], personId: string): Spot[] {
+    return this.floor.spots.filter(
+      (spot) =>
+        kinds.includes(spot.kind) &&
+        !this.isTaken(spot.tile, personId) &&
+        !this.inRenovation(spot.tile),
     );
-    const appliances = free.filter(
-      (spot) => spot.kind === 'coffee' || spot.kind === 'cooler' || spot.kind === 'vending',
-    );
-    const social = free.filter(
-      (spot) => spot.kind === 'sofa' || spot.kind === 'stand' || spot.kind === 'arcade',
-    );
+  }
+
+  private commonsDestination(person: Person): Destination | null {
+    const reason = person.visit?.reason ?? 'break';
     let spot: Spot | undefined;
-    if (wantsCoffee) {
-      spot = appliances.find((candidate) => candidate.kind === 'coffee') ?? appliances[0];
+    if (person.visit?.phase === 'coffee') {
+      const kitchen = this.freeSpots(KITCHEN_SPOTS, person.id);
+      spot = kitchen.find((candidate) => candidate.kind === 'coffee') ?? kitchen[0];
     } else {
+      const area = weighted(this.random, HANGOUT_WEIGHTS[reason]);
+      const preferred = this.freeSpots(HANGOUT_SPOTS[area], person.id);
+      const pool =
+        preferred.length > 0
+          ? preferred
+          : this.freeSpots(Object.values(HANGOUT_SPOTS).flat(), person.id);
       // Join someone who is already hanging out, the way people drift into conversations.
       const company = [...this.people.values()].filter(
         (other) =>
-          other.id !== person.id && other.room === LOUNGE_ID && other.lounge?.phase === 'hangout',
+          other.id !== person.id && other.visit?.phase === 'hangout' && other.arrivedAt !== null,
       );
-      const near = social.filter((candidate) =>
+      const near = pool.filter((candidate) =>
         company.some(
           (other) =>
             Math.abs(other.x - candidate.tile.x) + Math.abs(other.y - candidate.tile.y) <= 2,
         ),
       );
-      const pool = near.length > 0 && this.random() < 0.75 ? near : social;
-      spot = pool.length > 0 ? pick(this.random, pool) : undefined;
+      const choices = near.length > 0 && this.random() < 0.7 ? near : pool;
+      spot = choices.length > 0 ? pick(this.random, choices) : undefined;
     }
     if (spot) {
       return {
-        goal: 'lounge',
-        room: LOUNGE_ID,
+        goal: 'commons',
         tile: spot.tile,
         facing: spot.facing,
-        pose: spot.sit ? 'sit' : wantsCoffee ? 'drink' : 'stand',
+        pose: SPOT_POSE[spot.kind],
         partner: null,
       };
     }
-    const tile = this.freeTile(LOUNGE_ID, person.id);
-    if (!tile) return null;
-    return { goal: 'lounge', room: LOUNGE_ID, tile, facing: 'sw', pose: 'stand', partner: null };
+    const tile = this.freeTile(person.id, (x) => x < COMMONS_W);
+    return tile ? { goal: 'commons', tile, facing: 'sw', pose: 'stand', partner: null } : null;
+  }
+
+  private meetingDestination(person: Person, partnerId: string): Destination | null {
+    const seats = this.freeSpots(['meeting'], person.id);
+    const partner = this.people.get(partnerId);
+    const anchor = partner?.dest?.goal === 'meeting' ? partner.dest.tile : null;
+    const distance = (tile: Tile) =>
+      anchor ? Math.abs(tile.x - anchor.x) + Math.abs(tile.y - anchor.y) : 0;
+    // Sit next to whoever is already at the table, or take the first free chair.
+    const seat = [...seats].sort((a, b) => distance(a.tile) - distance(b.tile))[0];
+    if (!seat) return this.visitDestination(person, partnerId);
+    return {
+      goal: 'meeting',
+      tile: seat.tile,
+      facing: seat.facing,
+      pose: 'sit',
+      partner: partnerId,
+    };
   }
 
   private visitDestination(person: Person, partnerId: string): Destination | null {
     const partner = this.people.get(partnerId);
-    if (!partner?.room) return null;
-    const room = this.rooms.get(partner.room);
-    if (!room) return null;
+    if (partner?.stage !== 'present') return null;
     const base = { x: Math.round(partner.x), y: Math.round(partner.y) };
     const candidates: Tile[] = [
       { x: base.x, y: base.y + 1 },
@@ -516,18 +568,20 @@ export class World {
       { x: base.x, y: base.y - 1 },
     ];
     const current = person.dest?.partner === partnerId ? person.dest.tile : null;
-    const tile =
-      (current && candidates.some((candidate) => sameTile(candidate, current)) ? current : null) ??
-      candidates.find(
-        (candidate) =>
-          isWalkable(room.layout, candidate) &&
-          !this.isTaken(room.id, candidate, person.id) &&
-          !room.layout.desks.some((desk) => sameTile(desk.seat, candidate)),
-      );
+    const seats = new Set(
+      this.floor.zones.flatMap((zone) => zone.desks.map((desk) => `${desk.seat.x},${desk.seat.y}`)),
+    );
+    const usable = (tile: Tile) =>
+      isWalkable(this.floor, tile) &&
+      !this.isTaken(tile, person.id) &&
+      !seats.has(`${tile.x},${tile.y}`) &&
+      !this.inRenovation(tile);
+    const keep =
+      current && candidates.some((candidate) => sameTile(candidate, current)) && usable(current);
+    const tile = keep ? current : candidates.find(usable);
     if (!tile) return null;
     return {
       goal: 'visit',
-      room: room.id,
       tile,
       facing: lookDir(tile, base, 'ne'),
       pose: 'stand',
@@ -535,12 +589,11 @@ export class World {
     };
   }
 
-  private isTaken(roomId: string, tile: Tile, exceptId: string): boolean {
+  private isTaken(tile: Tile, exceptId: string): boolean {
     for (const other of this.people.values()) {
-      if (other.id === exceptId) continue;
-      if (other.dest?.room === roomId && sameTile(other.dest.tile, tile)) return true;
+      if (other.id === exceptId || other.stage === 'hidden') continue;
+      if (other.dest && sameTile(other.dest.tile, tile)) return true;
       if (
-        other.room === roomId &&
         Math.round(other.x) === tile.x &&
         Math.round(other.y) === tile.y &&
         other.path.length === 0
@@ -551,15 +604,19 @@ export class World {
     return false;
   }
 
-  private freeTile(roomId: string, personId: string): Tile | null {
-    const room = this.rooms.get(roomId);
-    if (!room) return null;
+  private freeTile(personId: string, area: (x: number, y: number) => boolean): Tile | null {
     const options: Tile[] = [];
-    for (let y = 1; y < room.layout.depth; y += 1) {
-      for (let x = 1; x < room.layout.width; x += 1) {
+    for (let y = 1; y < this.floor.depth; y += 1) {
+      for (let x = 1; x < this.floor.width; x += 1) {
         const tile = { x, y };
-        if (isWalkable(room.layout, tile) && !this.isTaken(roomId, tile, personId))
+        if (
+          area(x, y) &&
+          isWalkable(this.floor, tile) &&
+          !this.isTaken(tile, personId) &&
+          !this.inRenovation(tile)
+        ) {
           options.push(tile);
+        }
       }
     }
     return options.length > 0 ? pick(this.random, options) : null;
@@ -567,9 +624,7 @@ export class World {
 
   private isAvailable(id: string): boolean {
     const other = this.people.get(id);
-    return Boolean(
-      other && other.stage === 'present' && other.room && other.path.length === 0 && !other.script,
-    );
+    return Boolean(other && other.stage === 'present' && !other.departing);
   }
 
   // ─── Conversations ────────────────────────────────────────────────────────────────────────
@@ -583,14 +638,16 @@ export class World {
       return;
     }
     if (script.step < 0) {
-      // Start talking once there; give up if the other person never becomes reachable.
-      if (this.time - person.goalSince > 15) {
+      // Start once both are there; give up if the other person never makes it.
+      if (this.time - person.goalSince > 20) {
         if (script.kind === 'brief') person.briefed = true;
         if (script.kind === 'report') person.reported = true;
         this.finishScript(person);
         return;
       }
-      if (person.arrivedAt === null || person.dest?.goal !== 'visit') return;
+      if (person.arrivedAt === null || !person.dest || person.dest.goal === 'desk') return;
+      const partnerSeated = partner.dest?.goal === 'meeting' && partner.arrivedAt !== null;
+      if (script.kind === 'brief' && !partnerSeated) return;
       script.step = 0;
       script.timer = 0;
     }
@@ -653,18 +710,18 @@ export class World {
   }
 
   private updateChatter(): void {
-    const loungers = [...this.people.values()].filter(
+    if (this.time < this.nextChatAt) return;
+    const resting = [...this.people.values()].filter(
       (person) =>
-        person.room === LOUNGE_ID &&
         person.stage === 'present' &&
+        person.dest?.goal === 'commons' &&
         person.arrivedAt !== null &&
         person.path.length === 0 &&
         !person.script,
     );
-    for (const speaker of loungers) {
-      if (this.time < this.nextLoungeChatAt) return;
+    for (const speaker of resting) {
       if (speaker.nextChatAt > this.time) continue;
-      const partner = loungers.find(
+      const partner = resting.find(
         (other) =>
           other !== speaker &&
           other.nextChatAt <= this.time + 6 &&
@@ -674,11 +731,10 @@ export class World {
         speaker.nextChatAt = this.time + 3;
         continue;
       }
-      const room = this.rooms.get(partner.home)?.name ?? '';
+      const room = this.teams.get(partner.home)?.name ?? '';
       const detail = speaker.agent.detail ?? '';
-      const reason = speaker.lounge?.reason;
       const lines =
-        reason === 'renovation'
+        speaker.visit?.reason === 'renovation'
           ? this.say.renovationTalk
           : this.say.smallTalk.filter(
               (line) =>
@@ -687,9 +743,10 @@ export class World {
       this.speak(speaker, lines, { room, detail });
       this.queueSpeech(partner, pick(this.random, this.say.smallTalkReply), TUNING.replyDelay);
       this.face(speaker, partner);
-      this.nextLoungeChatAt = this.time + TUNING.loungeChatGap;
+      this.nextChatAt = this.time + TUNING.loungeChatGap;
       speaker.nextChatAt = this.time + between(this.random, TUNING.chatGapMin, TUNING.chatGapMax);
       partner.nextChatAt = this.time + between(this.random, TUNING.chatGapMin, TUNING.chatGapMax);
+      return;
     }
   }
 
@@ -728,35 +785,18 @@ export class World {
       case 'entering': {
         const progress = Math.min(1, person.stageTime / TUNING.doorFade);
         person.alpha = progress;
-        person.x = -DOOR_STEP * (1 - progress);
+        person.x = this.floor.door.x - DOOR_STEP * (1 - progress);
         if (progress >= 1) this.setStage(person, 'present');
         return;
       }
       case 'exiting': {
         const progress = Math.min(1, person.stageTime / TUNING.doorFade);
         person.alpha = 1 - progress;
-        person.x = -DOOR_STEP * progress;
+        person.x = this.floor.door.x - DOOR_STEP * progress;
         if (progress < 1) return;
-        // Someone who came back mid-exit walks on instead of vanishing.
-        if (person.departing && (!person.dest || person.dest.goal === 'exit')) {
-          person.stage = 'gone';
-          return;
-        }
-        person.room = null;
-        this.setStage(person, 'transit');
-        return;
-      }
-      case 'transit': {
-        if (person.stageTime < TUNING.transit) return;
-        if (person.departing && (!person.dest || person.dest.goal === 'exit')) {
-          person.stage = 'gone';
-          return;
-        }
-        this.think(person);
-        const target = person.dest?.room;
-        const room = target ? this.rooms.get(target) : undefined;
-        if (room && (room.phase === 'open' || room.kind === 'lounge')) this.enter(person, room.id);
-        else if (person.stageTime > 5) this.enter(person, LOUNGE_ID);
+        // Someone who came back mid-exit walks in again instead of vanishing.
+        if (person.departing) person.stage = 'gone';
+        else this.enter(person);
         return;
       }
       case 'present':
@@ -772,23 +812,19 @@ export class World {
       person.stage = 'gone';
       return;
     }
-    const home = this.rooms.get(person.home);
-    if (!home || home.phase === 'opening' || home.phase === 'closing') return;
-    this.enter(person, home.phase === 'open' ? home.id : LOUNGE_ID);
+    this.enter(person);
     if (person.agent.kind === 'session') this.speak(person, this.say.greet);
-    this.addLog('joined', { name: person.name, room: home.name });
+    this.addLog('joined', { name: person.name, room: this.teams.get(person.home)?.name ?? '' });
   }
 
-  private enter(person: Person, roomId: string): void {
-    const room = this.rooms.get(roomId);
-    if (!room) return;
-    person.room = roomId;
-    person.x = -DOOR_STEP;
-    person.y = room.layout.door.y;
+  private enter(person: Person): void {
+    person.x = this.floor.door.x - DOOR_STEP;
+    person.y = this.floor.door.y;
     person.dir = 'se';
     person.path = [];
     person.alpha = 0;
     person.arrivedAt = null;
+    person.shown = true;
     this.setStage(person, 'entering');
   }
 
@@ -798,45 +834,37 @@ export class World {
   }
 
   private walk(person: Person, dt: number): void {
-    const room = person.room ? this.rooms.get(person.room) : undefined;
     const dest = person.dest;
-    if (!room || !dest) return;
-    const leaving = dest.goal === 'exit' || dest.room !== room.id;
-    const target = leaving ? room.layout.door : dest.tile;
-
+    if (!dest) return;
+    const target = dest.tile;
     const here = { x: Math.round(person.x), y: Math.round(person.y) };
-    if (!isWalkable(room.layout, here) && person.path.length === 0) {
-      // The floor changed under someone; put them back by the door.
-      person.x = room.layout.door.x;
-      person.y = room.layout.door.y;
-      return;
-    }
+
     const pathEnd = person.path.at(-1);
-    if (
-      person.path.length === 0 ? !sameTile(here, target) : pathEnd && !sameTile(pathEnd, target)
-    ) {
+    const needsRoute =
+      person.path.length === 0 ? !sameTile(here, target) : pathEnd && !sameTile(pathEnd, target);
+    if (needsRoute) {
       const from = person.path[0] ?? here;
       const avoid = new Set(
         [...this.people.values()]
-          .filter((other) => other !== person && other.room === room.id && other.path.length === 0)
+          .filter(
+            (other) => other !== person && other.stage === 'present' && other.path.length === 0,
+          )
           .map((other) => `${Math.round(other.x)},${Math.round(other.y)}`),
       );
-      const route = findPath(room.layout, from, target, avoid);
+      const route = findPath(this.floor, from, target, avoid);
       if (route === null) {
         person.x = target.x;
         person.y = target.y;
         person.path = [];
       } else {
-        person.path =
-          sameTile(from, here) && person.x === here.x && person.y === here.y
-            ? route
-            : [from, ...route];
+        const onTile = sameTile(from, here) && person.x === here.x && person.y === here.y;
+        person.path = onTile ? route : [from, ...route];
       }
     }
 
     const next = person.path[0];
     if (!next) {
-      if (leaving) {
+      if (dest.goal === 'exit') {
         person.dir = 'nw';
         this.setStage(person, 'exiting');
         return;
@@ -873,180 +901,203 @@ export class World {
 
   private arrive(person: Person): void {
     person.arrivedAt = this.time;
-    const visit = person.lounge;
-    if (visit && person.dest?.room === LOUNGE_ID) {
-      visit.until =
-        this.time +
-        (visit.phase === 'coffee'
+    const visit = person.visit;
+    if (visit && person.dest?.goal === 'commons') {
+      const stay =
+        visit.phase === 'coffee'
           ? TUNING.coffeeFor
-          : between(this.random, TUNING.hangoutMin, TUNING.hangoutMax));
-    }
-    // Coming back to a freshly built room is worth a comment.
-    const home = this.rooms.get(person.home);
-    if (
-      person.dest?.goal === 'desk' &&
-      home?.phase === 'open' &&
-      home.phaseTime < 12 &&
-      this.random() < 0.3
-    ) {
-      this.speak(person, this.say.returning);
+          : between(this.random, TUNING.hangoutMin, TUNING.hangoutMax);
+      visit.until = this.time + stay;
     }
   }
 
+  /** Seated people keep facing their seat, except at a desk; everyone else turns to talk. */
   private restingDir(person: Person, dest: Destination): Person['dir'] {
     const other = person.lookAt ? this.people.get(person.lookAt.id) : undefined;
-    if (other && other.room === person.room) {
+    const seated = dest.pose === 'sit' || dest.pose === 'type';
+    if (other && (!seated || dest.goal === 'desk')) {
       return lookDir({ x: person.x, y: person.y }, { x: other.x, y: other.y }, dest.facing);
     }
     return dest.facing;
   }
 
-  // ─── Rooms ────────────────────────────────────────────────────────────────────────────────
+  // ─── Teams and renovations ────────────────────────────────────────────────────────────────
 
-  private updateRooms(dt: number): void {
-    const members = new Map<string, number>();
+  private members(teamId: string): number {
+    let count = 0;
     for (const person of this.people.values()) {
-      if (!person.departing) members.set(person.home, (members.get(person.home) ?? 0) + 1);
+      if (person.home === teamId && !person.departing) count += 1;
     }
-    for (const room of [...this.rooms.values()]) {
-      room.phaseTime += dt;
-      if (room.kind === 'lounge') {
-        this.updateLounge(room);
-        continue;
-      }
-      const count = members.get(room.id) ?? 0;
-      const occupied = this.isOccupied(room.id);
-      switch (room.phase) {
-        case 'opening':
-        case 'building':
-          if (room.phaseTime >= TUNING.build) this.setPhase(room, 'open');
-          break;
-        case 'open': {
-          const wanted = workTierFor(Math.max(1, count));
-          if (wanted > room.layout.tier) {
-            this.renovate(room, wanted);
-          } else if (wanted + 1 < room.layout.tier) {
-            // Shrink with a tier of headroom, so one newcomer doesn't trigger another rebuild.
-            room.shrinkFor += dt;
-            if (room.shrinkFor > TUNING.shrinkAfter) this.renovate(room, wanted + 1);
-          } else {
-            room.shrinkFor = 0;
-          }
-          const anyone = [...this.people.values()].some((person) => person.home === room.id);
-          room.emptyFor = anyone || occupied ? 0 : room.emptyFor + dt;
-          if (room.emptyFor > TUNING.closeAfterEmpty) this.setPhase(room, 'closing');
-          break;
-        }
-        case 'evacuating':
-          if (!occupied || room.phaseTime > TUNING.evacuateTimeout) this.rebuild(room);
-          break;
-        case 'closing':
-          if (count > 0) {
-            this.setPhase(room, 'opening');
-          } else if (room.phaseTime >= TUNING.close) {
-            this.rooms.delete(room.id);
-            this.layoutDirty = true;
-            this.addLog('closed', { room: room.name });
-          }
-          break;
-      }
+    return count;
+  }
+
+  private updateTeams(dt: number): void {
+    for (const team of this.teams.values()) {
+      const anyone = [...this.people.values()].some((person) => person.home === team.id);
+      team.emptyFor = anyone ? 0 : team.emptyFor + dt;
+      const wanted = teamTierFor(Math.max(1, this.members(team.id)));
+      team.shrinkFor = team.tier >= 0 && wanted + 1 < team.tier ? team.shrinkFor + dt : 0;
     }
   }
 
-  private updateLounge(lounge: WorldRoom): void {
-    if (lounge.phase === 'building') {
-      if (lounge.phaseTime >= TUNING.build) this.setPhase(lounge, 'open');
+  /** The teams the floor should hold right now, in floor order, with the size each needs. */
+  private desiredTeams(): TeamRequest[] {
+    return [...this.teams.values()]
+      .filter((team) => team.emptyFor <= TUNING.closeAfterEmpty)
+      .sort((a, b) => a.order - b.order)
+      .map((team) => {
+        const wanted = teamTierFor(Math.max(1, this.members(team.id)));
+        let tier = team.tier;
+        // Grow right away; shrink only after a while, keeping a size of headroom.
+        if (tier < 0 || wanted > tier) tier = wanted;
+        else if (team.shrinkFor > TUNING.shrinkAfter) tier = wanted + 1;
+        return { id: team.id, tier };
+      });
+  }
+
+  private updateRenovation(dt: number): void {
+    if (!this.initialized) return;
+    const renovation = this.renovation;
+    if (!renovation) {
+      this.planRenovation();
       return;
     }
-    const wanted = loungeTierFor(this.people.size);
-    if (wanted !== lounge.layout.tier && !this.isOccupied(LOUNGE_ID)) {
-      lounge.layout = loungeLayout(wanted);
-      this.setPhase(lounge, 'building');
-      this.layoutDirty = true;
+    renovation.time += dt;
+    if (renovation.phase === 'evacuating') {
+      const occupied = [...this.people.values()].some(
+        (person) =>
+          person.stage === 'present' &&
+          this.inRenovation({ x: Math.round(person.x), y: Math.round(person.y) }),
+      );
+      if (!occupied || renovation.time > TUNING.evacuateTimeout) this.swapFloor(renovation);
+      return;
     }
+    if (renovation.time < TUNING.build) return;
+    this.renovation = null;
+    for (const [id, team] of this.teams) {
+      if (team.emptyFor > TUNING.closeAfterEmpty && !this.zoneOfTeam(id)) {
+        this.teams.delete(id);
+        this.addLog('closed', { room: team.name });
+      }
+    }
+    for (const person of this.people.values()) person.brainTimer = 0;
   }
 
-  /** Someone is inside, walking through the door, or on the way. */
-  private isOccupied(roomId: string): boolean {
-    for (const person of this.people.values()) {
-      if (person.room === roomId) return true;
-      if (person.stage === 'transit' && person.dest?.room === roomId) return true;
-    }
-    return false;
-  }
+  private planRenovation(): void {
+    const desired = this.desiredTeams();
+    const built = this.floor.zones.filter((zone) => zone.kind === 'team');
+    const unchanged =
+      desired.length === built.length &&
+      desired.every(
+        (request, index) => built[index]?.id === request.id && built[index].tier === request.tier,
+      );
+    if (unchanged) return;
 
-  private renovate(room: WorldRoom, tier: number): void {
-    room.pendingTier = tier;
-    room.shrinkFor = 0;
-    this.setPhase(room, 'evacuating');
-    this.addLog(tier > room.layout.tier ? 'growing' : 'shrinking', { room: room.name });
+    const next = buildFloor(desired);
+    const before = new Map(built.map((zone) => [zone.id, zone]));
+    const after = new Map(
+      next.zones.filter((zone) => zone.kind === 'team').map((zone) => [zone.id, zone]),
+    );
+    const zones = new Set<string>();
+    for (const id of new Set([...before.keys(), ...after.keys()])) {
+      const old = before.get(id);
+      const fresh = after.get(id);
+      if (!old || !fresh || old.tier !== fresh.tier || !sameRect(old.rect, fresh.rect)) {
+        zones.add(id);
+      }
+    }
+    const rects = [...zones].flatMap((id) =>
+      [before.get(id)?.rect, after.get(id)?.rect].filter((rect) => rect !== undefined),
+    );
+    const tierOf = (map: Map<string, Zone>, id: string) => map.get(id)?.tier;
+    const grew = new Set(
+      [...zones].filter((id) => (tierOf(after, id) ?? -1) > (tierOf(before, id) ?? Infinity)),
+    );
+    const shrank = new Set(
+      [...zones].filter((id) => (tierOf(after, id) ?? Infinity) < (tierOf(before, id) ?? -1)),
+    );
+    for (const id of grew) this.addLog('growing', { room: this.teams.get(id)?.name ?? '' });
+    for (const id of shrank) this.addLog('shrinking', { room: this.teams.get(id)?.name ?? '' });
+
+    this.pendingPlan = next;
+    this.renovation = { phase: 'evacuating', time: 0, zones, rects, grew, shrank };
     const speaker = [...this.people.values()].find(
-      (person) => person.room === room.id && person.stage === 'present',
+      (person) =>
+        person.stage === 'present' &&
+        grew.has(person.home) &&
+        this.inRenovation({ x: Math.round(person.x), y: Math.round(person.y) }),
     );
-    if (speaker) this.speak(speaker, this.say.evacuate, { room: room.name });
+    if (speaker) {
+      this.speak(speaker, this.say.evacuate, { room: this.teams.get(speaker.home)?.name ?? '' });
+    }
     // Everyone re-thinks right away instead of waiting out their current plan.
-    for (const person of this.people.values()) if (person.home === room.id) person.brainTimer = 0;
+    for (const person of this.people.values()) person.brainTimer = 0;
   }
 
-  private rebuild(room: WorldRoom): void {
+  private swapFloor(renovation: Renovation): void {
+    const plan = this.pendingPlan;
+    this.pendingPlan = null;
+    if (!plan) return;
+    this.replaceFloor(plan);
+    renovation.phase = 'building';
+    renovation.time = 0;
     for (const person of this.people.values()) {
-      if (person.room !== room.id) continue;
-      // Stragglers are shown the door.
-      person.room = null;
       person.path = [];
-      person.dest = null;
-      this.setStage(person, 'transit');
+      const here = { x: Math.round(person.x), y: Math.round(person.y) };
+      // Stragglers in the builders' way step aside to the nearest free floor.
+      if (person.stage === 'present' && (!isWalkable(plan, here) || this.inRenovation(here))) {
+        const spot = this.nearestFree(here);
+        person.x = spot.x;
+        person.y = spot.y;
+      }
+      if (person.dest && !this.isStillFree(person.dest.tile)) {
+        person.dest = null;
+        person.arrivedAt = null;
+      }
     }
-    room.layout = workRoomLayout(room.pendingTier ?? room.layout.tier, room.id);
-    room.pendingTier = null;
-    for (const index of [...room.deskOwner.keys()]) {
-      if (index >= room.layout.desks.length) room.deskOwner.delete(index);
-    }
-    this.setPhase(room, 'building');
-    this.layoutDirty = true;
   }
 
-  private setPhase(room: WorldRoom, phase: WorldRoom['phase']): void {
-    room.phase = phase;
-    room.phaseTime = 0;
-  }
-
-  private relayout(): void {
-    this.layoutDirty = false;
-    const ordered = [...this.rooms.values()].sort((a, b) => a.order - b.order);
-    const origins = packOffice(
-      ordered.map((room) => ({
-        id: room.id,
-        bounds: roomBounds(room.layout.width, room.layout.depth),
-      })),
-      this.aspect,
-    );
-    for (const room of ordered) {
-      const target = origins.get(room.id);
-      if (!target) continue;
-      const fresh = Number.isNaN(room.target.x);
-      room.target = target;
-      if (fresh || !this.initializedLayout) room.origin = { ...target };
+  private replaceFloor(plan: FloorPlan): void {
+    this.floor = plan;
+    this.floorVersion += 1;
+    for (const zone of plan.zones) {
+      const team = this.teams.get(zone.id);
+      if (!team || zone.kind !== 'team') continue;
+      team.tier = zone.tier;
+      team.shrinkFor = 0;
+      for (const index of [...team.deskOwner.keys()]) {
+        if (index >= zone.desks.length) team.deskOwner.delete(index);
+      }
     }
-    this.initializedLayout = true;
-    this.layoutVersion += 1;
   }
 
-  /** Re-packs the office for a new screen shape. */
-  setAspect(aspect: number): void {
-    if (Math.abs(aspect - this.aspect) < 0.05) return;
-    this.aspect = aspect;
-    this.layoutDirty = true;
-  }
-
-  private easeRooms(dt: number): void {
-    const blend = 1 - Math.exp(-dt * 5);
-    for (const room of this.rooms.values()) {
-      room.origin.x += (room.target.x - room.origin.x) * blend;
-      room.origin.y += (room.target.y - room.origin.y) * blend;
-      if (Math.abs(room.target.x - room.origin.x) < 0.3) room.origin.x = room.target.x;
-      if (Math.abs(room.target.y - room.origin.y) < 0.3) room.origin.y = room.target.y;
+  private nearestFree(from: Tile): Tile {
+    const seen = new Set<string>([`${from.x},${from.y}`]);
+    const queue: Tile[] = [from];
+    while (queue.length > 0) {
+      const tile = queue.shift();
+      if (!tile) break;
+      if (isWalkable(this.floor, tile) && !this.inRenovation(tile)) return tile;
+      for (const [dx, dy] of [
+        [1, 0],
+        [-1, 0],
+        [0, 1],
+        [0, -1],
+      ] as const) {
+        const next = { x: tile.x + dx, y: tile.y + dy };
+        const key = `${next.x},${next.y}`;
+        const outside =
+          next.x < 0 || next.y < 0 || next.x >= this.floor.width || next.y >= this.floor.depth;
+        if (seen.has(key) || outside) continue;
+        seen.add(key);
+        queue.push(next);
+      }
     }
+    return { ...this.floor.door };
+  }
+
+  inRenovation(tile: Tile): boolean {
+    return this.renovation?.rects.some((rect) => inRect(rect, tile)) ?? false;
   }
 
   private addLog(kind: LogKind, params: Record<string, string>): void {
@@ -1074,6 +1125,17 @@ export class World {
   isDozing(person: Person): boolean {
     return this.poseOf(person) === 'sleep';
   }
+
+  /** The zone a tile belongs to: a team area or one of the shared spaces. */
+  zoneAt(x: number, y: number): Zone | undefined {
+    const tile = { x: Math.round(x), y: Math.round(y) };
+    return this.floor.zones.find((zone) => inRect(zone.rect, tile));
+  }
+
+  /** Whether a team's area is open or being built. */
+  teamPhase(teamId: string): 'open' | 'renovating' {
+    return this.hasDesks(teamId) ? 'open' : 'renovating';
+  }
 }
 
 function goalKey(goal: Goal): string {
@@ -1091,4 +1153,16 @@ function shorten(text: string | null): string {
   if (!text) return '';
   const clean = text.replace(/\s+/g, ' ').trim();
   return clean.length > TASK_MAX ? `${clean.slice(0, TASK_MAX - 1)}…` : clean;
+}
+
+function weighted<T>(random: () => number, entries: readonly (readonly [T, number])[]): T {
+  const total = entries.reduce((sum, [, weight]) => sum + weight, 0);
+  let roll = random() * total;
+  for (const [value, weight] of entries) {
+    roll -= weight;
+    if (roll <= 0) return value;
+  }
+  const last = entries.at(-1);
+  if (!last) throw new Error('weighted() needs entries');
+  return last[0];
 }

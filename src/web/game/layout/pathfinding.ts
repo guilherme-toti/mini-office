@@ -1,4 +1,4 @@
-import { isWalkable, type RoomLayout, type Tile } from './types.ts';
+import { isWalkable, type Grid, type Tile } from './types.ts';
 
 const NEIGHBOURS: readonly Tile[] = [
   { x: 1, y: 0 },
@@ -12,7 +12,7 @@ const NEIGHBOURS: readonly Tile[] = [
  * axes like Habbo avatars. Returns the tiles after `from`, ending on `to`, or null.
  */
 export function findPath(
-  layout: RoomLayout,
+  layout: Grid,
   from: Tile,
   to: Tile,
   avoid: ReadonlySet<string> = new Set(),
@@ -73,7 +73,7 @@ function rebuild(
 }
 
 /** Every walkable tile reachable from `from`. */
-export function reachable(layout: RoomLayout, from: Tile): Set<string> {
+export function reachable(layout: Grid, from: Tile): Set<string> {
   const seen = new Set<string>([`${from.x},${from.y}`]);
   const queue: Tile[] = [from];
   while (queue.length > 0) {

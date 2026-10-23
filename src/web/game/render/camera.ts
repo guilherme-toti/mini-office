@@ -1,7 +1,10 @@
-import type { Rect } from '../layout/office-layout.ts';
+import type { PixelRect } from '../gfx/floor-art.ts';
 
-/** Device pixels per art pixel. Whole numbers keep the pixel art crisp; 1.5 bridges the big jump. */
-const SCALES = [0.5, 1, 1.5, 2, 3, 4, 5, 6, 8] as const;
+/**
+ * Device pixels per art pixel. Whole numbers keep the pixel art crisp; the in-between steps let
+ * a big office fill the screen, and on high-density screens their unevenness is hard to see.
+ */
+const SCALES = [0.5, 0.75, 1, 1.25, 1.5, 2, 2.5, 3, 4, 5, 6, 8] as const;
 
 export interface Insets {
   top: number;
@@ -21,7 +24,7 @@ export class Camera {
   /** True until the user pans or zooms by hand; then the office stops refitting itself. */
   autoFit = true;
 
-  fit(bounds: Rect, width: number, height: number, insets: Insets, instant = false): void {
+  fit(bounds: PixelRect, width: number, height: number, insets: Insets, instant = false): void {
     const usableW = Math.max(1, width - insets.left - insets.right);
     const usableH = Math.max(1, height - insets.top - insets.bottom);
     const fitting = SCALES.filter(

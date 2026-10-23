@@ -1,4 +1,5 @@
 import { drawAvatar, type AvatarFrame } from '../gfx/avatar-art.ts';
+import { bakeFloor, drawFloorTile, type FloorArt } from '../gfx/floor-art.ts';
 import { drawFurniture } from '../gfx/furniture-art.ts';
 import {
   drawScreen,
@@ -6,10 +7,9 @@ import {
   type ScreenPattern,
   type StatusIcon,
 } from '../gfx/overlay-art.ts';
+import { FLOOR_STYLES } from '../gfx/palette.ts';
 import { Pixmap } from '../gfx/pixmap.ts';
-import type { RoomTheme } from '../gfx/palette.ts';
-import { bakeRoom, drawFloorTile } from '../gfx/room-art.ts';
-import type { FurnitureKind, RoomLayout } from '../layout/types.ts';
+import type { Dir, FloorPlan, FurnitureKind } from '../layout/types.ts';
 import { lookKey } from '../sim/persona.ts';
 
 const MAX_SPRITES = 2500;
@@ -17,6 +17,13 @@ const MAX_SPRITES = 2500;
 export interface Sprite {
   canvas: HTMLCanvasElement;
   pm: Pixmap;
+}
+
+export interface BakedFloor {
+  floor: HTMLCanvasElement;
+  walls: HTMLCanvasElement;
+  originX: number;
+  originY: number;
 }
 
 export function toCanvas(pm: Pixmap): HTMLCanvasElement {
@@ -46,10 +53,7 @@ function mirrored(pm: Pixmap): Pixmap {
 /** Every sprite is drawn once into a canvas and reused for the rest of the session. */
 export class SpriteCache {
   private readonly sprites = new Map<string, Sprite>();
-  private readonly rooms = new WeakMap<
-    RoomLayout,
-    { floor: HTMLCanvasElement; walls: HTMLCanvasElement; originX: number; originY: number }
-  >();
+  private baked: { key: string; art: BakedFloor } | null = null;
 
   /** Least recently used first: a Map keeps insertion order, and every hit re-inserts. */
   private get(key: string, make: () => Pixmap): Sprite {
@@ -77,8 +81,10 @@ export class SpriteCache {
     });
   }
 
-  furniture(kind: FurnitureKind, variant: number): Sprite {
-    return this.get(`furniture|${kind}|${variant}`, () => drawFurniture(kind, variant));
+  furniture(kind: FurnitureKind, variant: number, facing: Dir): Sprite {
+    return this.get(`furniture|${kind}|${variant}|${facing}`, () =>
+      drawFurniture(kind, variant, facing),
+    );
   }
 
   screen(pattern: ScreenPattern, frame: number): Sprite {
@@ -89,24 +95,27 @@ export class SpriteCache {
     return this.get(`status|${icon}`, () => drawStatusBubble(icon));
   }
 
-  floorTile(theme: RoomTheme, parity: number): Sprite {
-    return this.get(`tile|${theme.floorA}|${theme.floorB}|${theme.floorStyle}|${parity}`, () =>
-      drawFloorTile(theme, parity),
-    );
+  floorTile(style: number, parity: number, seed: number): Sprite {
+    return this.get(`tile|${style}|${parity}|${seed}`, () => {
+      const floorStyle = FLOOR_STYLES[style] ?? FLOOR_STYLES[0];
+      return floorStyle ? drawFloorTile(floorStyle, parity, seed) : new Pixmap(32, 16);
+    });
   }
 
-  room(layout: RoomLayout, theme: RoomTheme) {
-    let art = this.rooms.get(layout);
-    if (!art) {
-      const baked = bakeRoom(layout, theme);
-      art = {
-        floor: toCanvas(baked.floor),
-        walls: toCanvas(baked.walls),
-        originX: baked.originX,
-        originY: baked.originY,
+  /** The whole floor, re-baked only when the plan or the set of areas being built changes. */
+  floor(plan: FloorPlan, key: string, skip: (x: number, y: number) => boolean): BakedFloor {
+    if (this.baked?.key !== key) {
+      const art: FloorArt = bakeFloor(plan, skip);
+      this.baked = {
+        key,
+        art: {
+          floor: toCanvas(art.floor),
+          walls: toCanvas(art.walls),
+          originX: art.originX,
+          originY: art.originY,
+        },
       };
-      this.rooms.set(layout, art);
     }
-    return art;
+    return this.baked.art;
   }
 }

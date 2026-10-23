@@ -1,42 +1,46 @@
 import type { AgentSnapshot } from '../../../shared/protocol.ts';
 import type { AvatarPose } from '../gfx/avatar-art.ts';
-import type { RoomTheme } from '../gfx/palette.ts';
-import type { Dir, RoomLayout, Tile } from '../layout/types.ts';
+import type { Dir, Rect, Tile } from '../layout/types.ts';
 import type { Persona } from './persona.ts';
 
-export const LOUNGE_ID = '__lounge__';
-
-export type RoomPhase = 'opening' | 'open' | 'evacuating' | 'building' | 'closing';
-
-export interface WorldRoom {
+/** A project's area on the floor. */
+export interface Team {
   id: string;
   name: string;
-  kind: 'work' | 'lounge';
-  theme: RoomTheme;
-  layout: RoomLayout;
-  phase: RoomPhase;
-  phaseTime: number;
-  pendingTier: number | null;
-  /** Native-pixel position of the room's back floor corner; eases toward `target`. */
-  origin: { x: number; y: number };
-  target: { x: number; y: number };
+  /** Teams keep their place on the floor in the order they first showed up. */
   order: number;
+  /** The size step currently built. */
+  tier: number;
   emptyFor: number;
   shrinkFor: number;
   deskOwner: Map<number, string>;
 }
 
-export type Stage = 'hidden' | 'entering' | 'present' | 'exiting' | 'transit' | 'gone';
+/**
+ * A floor rebuild in progress: people leave the affected areas, the plan is swapped, and the
+ * affected areas build up again while everyone else keeps working.
+ */
+export interface Renovation {
+  phase: 'evacuating' | 'building';
+  time: number;
+  /** Zone ids that change (moved, resized, added or removed). */
+  zones: Set<string>;
+  /** Old and new footprints of those zones: nobody may stand there during the swap. */
+  rects: Rect[];
+  grew: Set<string>;
+  shrank: Set<string>;
+}
 
-export type GoalKind = 'desk' | 'lounge' | 'visit' | 'exit';
+export type Stage = 'hidden' | 'entering' | 'present' | 'exiting' | 'gone';
+
+export type GoalKind = 'desk' | 'commons' | 'visit' | 'meeting' | 'exit';
 
 export interface Destination {
   goal: GoalKind;
-  room: string;
   tile: Tile;
   facing: Dir;
   pose: AvatarPose;
-  /** The person being visited, if any. */
+  /** The person being visited or met, if any. */
   partner: string | null;
 }
 
@@ -54,10 +58,11 @@ export interface Script {
   timer: number;
 }
 
-export type LoungeReason = 'break' | 'coffee' | 'renovation';
+/** Why someone is in the shared spaces, which shapes where they go and what they talk about. */
+export type BreakReason = 'break' | 'coffee' | 'renovation';
 
-export interface LoungeVisit {
-  reason: LoungeReason;
+export interface CommonsVisit {
+  reason: BreakReason;
   phase: 'coffee' | 'hangout';
   until: number;
 }
@@ -68,7 +73,6 @@ export interface Person {
   name: string;
   agent: AgentSnapshot;
   home: string;
-  room: string | null;
   x: number;
   y: number;
   dir: Dir;
@@ -87,13 +91,16 @@ export interface Person {
   briefed: boolean;
   reported: boolean;
   script: Script | null;
-  lounge: LoungeVisit | null;
+  visit: CommonsVisit | null;
   lookAt: { id: string; until: number } | null;
   nextChatAt: number;
   nextCheckInAt: number;
   sipUntil: number;
   brainTimer: number;
   lastActivity: string;
+  spawnedAt: number;
+  /** Ever walked in or was placed on screen, so leaving is worth a log line. */
+  shown: boolean;
 }
 
 export type LogKind = 'joined' | 'left' | 'growing' | 'shrinking' | 'opened' | 'closed';

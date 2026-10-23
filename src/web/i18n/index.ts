@@ -14,6 +14,11 @@ export function messagesFor(locale: Locale): Messages {
   return LOCALES[locale];
 }
 
+/** Picks the singular or plural form and fills in the number. */
+export function plural(forms: { one: string; other: string }, n: number): string {
+  return format(n === 1 ? forms.one : forms.other, { n });
+}
+
 /** Fills `{name}`-style placeholders. Unknown placeholders are left out. */
 export function format(template: string, params: Record<string, string | number> = {}): string {
   return template.replace(/\{(\w+)\}/g, (_, key: string) => String(params[key] ?? ''));
