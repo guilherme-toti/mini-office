@@ -77,6 +77,8 @@ export class OfficeEngine {
   private fittedVersion = -1;
   private hasFitted = false;
   private insets: Insets = { top: 0, right: 0, bottom: 0, left: 0 };
+  /** The same, plus whatever a person card covers, for centring on someone. */
+  private focusInsets: Insets = { top: 0, right: 0, bottom: 0, left: 0 };
   private readonly pointers = new Map<number, { x: number; y: number }>();
   private dragDistance = 0;
   private pinchDistance = 0;
@@ -131,10 +133,15 @@ export class OfficeEngine {
 
   getHud = (): HudState => this.hud;
 
-  /** The part of the canvas covered by HUD panels, so fitting keeps the office visible. */
-  setInsets(insets: Insets): void {
-    this.insets = insets;
-    this.fittedVersion = -1;
+  /**
+   * The part of the canvas covered by HUD panels (CSS px), so fitting keeps the office visible.
+   * `focus` also counts an open person card, so the person stays in view beside it.
+   */
+  setInsets(fit: Insets, focus: Insets): void {
+    const changed = JSON.stringify(fit) !== JSON.stringify(this.insets);
+    this.insets = fit;
+    this.focusInsets = focus;
+    if (changed) this.fittedVersion = -1;
   }
 
   select(id: string | null): void {
@@ -192,6 +199,7 @@ export class OfficeEngine {
       showNames: this.showNames,
       zoneNames: messages.zones,
       renovatingLabel: messages.room.renovating,
+      topLimit: this.insets.top * this.dpr,
     });
 
     this.hudTimer -= dt;
@@ -206,14 +214,16 @@ export class OfficeEngine {
     if (!person) return;
     // Aim a little above the feet, at the middle of the body.
     const { x: feetX, y: feetY } = project(person.x + 0.5, person.y + 0.5, 20);
-    this.camera.focus(feetX, feetY, 3 * this.dpr);
+    this.camera.focus(feetX, feetY, 3 * this.dpr, this.scaledInsets(this.focusInsets));
     // Follow only until the camera arrives; after that the user is free to look around.
-    if (Math.abs(this.camera.x - feetX) < 2 && Math.abs(this.camera.y - feetY) < 2)
+    const { aim } = this.camera;
+    if (Math.abs(this.camera.x - aim.x) < 2 && Math.abs(this.camera.y - aim.y) < 2) {
       this.followId = null;
+    }
   }
 
-  private scaledInsets(): Insets {
-    const { top, right, bottom, left } = this.insets;
+  private scaledInsets(insets: Insets = this.insets): Insets {
+    const { top, right, bottom, left } = insets;
     return {
       top: top * this.dpr,
       right: right * this.dpr,

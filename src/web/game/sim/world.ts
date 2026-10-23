@@ -71,6 +71,7 @@ const HANGOUT_WEIGHTS: Record<BreakReason, readonly (readonly [Hangout, number])
     ['games', 0.2],
   ],
 };
+const NAP_SPOTS: readonly SpotKind[] = ['sofa', 'bench', 'parasol', 'tv'];
 const SPOT_POSE: Record<SpotKind, AvatarPose> = {
   coffee: 'drink',
   cooler: 'drink',
@@ -113,6 +114,7 @@ export class World {
   private readonly pendingSpeech: { id: string; text: string; at: number }[] = [];
   /** One conversation starts at a time, so the shared spaces stay readable. */
   private nextChatAt = 0;
+  private doorFreeAt = 0;
 
   constructor(options: WorldOptions) {
     this.say = options.say;
@@ -317,9 +319,8 @@ export class World {
       }
       return goal('exit');
     }
-    if (!this.hasDesks(person.home)) return goal('commons', { reason: 'renovation' });
-
-    // New helpers get briefed in the meeting room; whoever called them joins them there.
+    // New helpers get briefed in the meeting room, whoever called them joins them there. The
+    // meeting room is never part of a renovation, so this comes before desks.
     if (!person.briefed) {
       if (parentId && this.isAvailable(parentId) && this.time - person.spawnedAt < 30) {
         return goal('meeting', { partner: parentId, script: 'brief' });
@@ -331,6 +332,7 @@ export class World {
         other.agent.parentId === person.id && !other.briefed && other.goalKey.startsWith('meeting'),
     );
     if (newcomer) return goal('meeting', { partner: newcomer.id });
+    if (!this.hasDesks(person.home)) return goal('commons', { reason: 'renovation' });
     if (person.script?.kind === 'checkIn') {
       return goal('visit', { partner: person.script.partner, script: 'checkIn' });
     }
@@ -338,8 +340,8 @@ export class World {
     const age = this.now - agent.activitySince;
     switch (agent.activity) {
       case 'waiting':
-        if (age < TUNING.waitAtDeskMs || age > TUNING.dozeAfterMs) return goal('desk');
-        return goal('commons', { reason: 'break' });
+        // Nothing to do: a moment at the desk with a raised hand, then off to relax.
+        return age < TUNING.waitAtDeskMs ? goal('desk') : goal('commons', { reason: 'break' });
       case 'running':
         return age > TUNING.longCommandMs ? goal('commons', { reason: 'coffee' }) : goal('desk');
       case 'delegating': {
@@ -409,6 +411,7 @@ export class World {
   private advanceVisit(person: Person): void {
     const visit = person.visit;
     if (!visit || person.arrivedAt === null || person.dest?.goal !== 'commons') return;
+    if (this.isDozing(person)) return;
     if (this.time < visit.until) {
       const standing = visit.phase === 'hangout' && person.dest.pose === 'stand';
       if (standing && this.time > person.sipUntil + 6 && this.random() < 0.05) {
@@ -458,7 +461,7 @@ export class World {
       goal: 'desk',
       tile: desk.seat,
       facing: desk.facing,
-      pose: deskPose(person, this.now),
+      pose: deskPose(person),
       partner: null,
     };
   }
@@ -504,7 +507,11 @@ export class World {
       spot = kitchen.find((candidate) => candidate.kind === 'coffee') ?? kitchen[0];
     } else {
       const area = weighted(this.random, HANGOUT_WEIGHTS[reason]);
-      const preferred = this.freeSpots(HANGOUT_SPOTS[area], person.id);
+      // Someone idle for ages looks for somewhere to sit and nap.
+      const preferred = this.freeSpots(
+        this.isSleepy(person) ? NAP_SPOTS : HANGOUT_SPOTS[area],
+        person.id,
+      );
       const pool =
         preferred.length > 0
           ? preferred
@@ -812,6 +819,9 @@ export class World {
       person.stage = 'gone';
       return;
     }
+    // One at a time through the door, like people actually arriving.
+    if (this.time < this.doorFreeAt) return;
+    this.doorFreeAt = this.time + TUNING.doorGap;
     this.enter(person);
     if (person.agent.kind === 'session') this.speak(person, this.say.greet);
     this.addLog('joined', { name: person.name, room: this.teams.get(person.home)?.name ?? '' });
@@ -1115,11 +1125,21 @@ export class World {
     const dest = person.dest;
     if (!dest || person.arrivedAt === null) return 'stand';
     if (dest.goal === 'desk') {
-      const seated = deskPose(person, this.now);
+      const seated = deskPose(person);
       return person.lookAt && seated === 'type' ? 'sit' : seated;
     }
     if (dest.pose === 'stand' && this.time < person.sipUntil) return 'drink';
+    const seated = dest.pose === 'sit' || dest.pose === 'type';
+    if (dest.goal === 'commons' && seated && this.isSleepy(person)) return 'sleep';
     return dest.pose;
+  }
+
+  /** Waiting long enough that a nap is the natural thing to do. */
+  private isSleepy(person: Person): boolean {
+    return (
+      person.agent.activity === 'waiting' &&
+      this.now - person.agent.activitySince > TUNING.dozeAfterMs
+    );
   }
 
   isDozing(person: Person): boolean {
@@ -1142,11 +1162,11 @@ function goalKey(goal: Goal): string {
   return [goal.kind, goal.reason ?? '', goal.partner ?? '', goal.script ?? ''].join(':');
 }
 
-function deskPose(person: Person, now: number): AvatarPose {
-  const { activity, activitySince } = person.agent;
-  if (activity === 'waiting') return now - activitySince > TUNING.dozeAfterMs ? 'sleep' : 'sit';
-  if (activity === 'thinking' || activity === 'reading') return 'sit';
-  return 'type';
+function deskPose(person: Person): AvatarPose {
+  const { activity } = person.agent;
+  return activity === 'waiting' || activity === 'thinking' || activity === 'reading'
+    ? 'sit'
+    : 'type';
 }
 
 function shorten(text: string | null): string {

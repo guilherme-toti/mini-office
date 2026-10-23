@@ -63,26 +63,35 @@ export function App() {
 
   const headerRef = useRef<HTMLElement>(null);
   const footerRef = useRef<HTMLDivElement>(null);
+  const stackRef = useRef<HTMLDivElement>(null);
+  const cardOpen = hud.selectedId !== null;
   useEffect(() => {
     const header = headerRef.current;
     const footer = footerRef.current;
-    if (!header || !footer) return;
+    const stack = stackRef.current;
+    if (!header || !footer || !stack) return;
     // The top bar wraps to more rows on narrow screens; fit the office below whatever it takes.
     const update = () => {
-      engine.setInsets({
+      const fit = {
         ...SIDE_INSET[desktop ? 'desktop' : 'mobile'],
         top: header.offsetHeight,
         bottom: footer.offsetHeight + 16,
-      });
+      };
+      // Centring on someone also clears their card: beside it on desktop, above it on phones.
+      const focus = desktop
+        ? { ...fit, left: cardOpen ? stack.offsetWidth + 32 : fit.left }
+        : { ...fit, bottom: stack.offsetHeight + 16 };
+      engine.setInsets(fit, focus);
     };
     update();
     const observer = new ResizeObserver(update);
     observer.observe(header);
     observer.observe(footer);
+    observer.observe(stack);
     return () => {
       observer.disconnect();
     };
-  }, [engine, desktop]);
+  }, [engine, desktop, cardOpen]);
 
   const changeSource = (next: SourceName) => {
     const url = new URL(window.location.href);
@@ -144,7 +153,10 @@ export function App() {
             </h2>
             <div className="min-h-0 flex-1 overflow-y-auto">{panel}</div>
           </aside>
-          <div className="pointer-events-none absolute bottom-4 left-4 flex w-[min(420px,calc(100%-400px))] flex-col gap-3">
+          <div
+            ref={stackRef}
+            className="pointer-events-none absolute bottom-4 left-4 flex w-[min(420px,calc(100%-400px))] flex-col gap-3"
+          >
             {/* The card tells the selected story; the log would only crowd it. */}
             {!selected ? <ActivityLog log={hud.log} now={now} /> : null}
             {selected ? (
@@ -164,7 +176,10 @@ export function App() {
           </div>
         </>
       ) : (
-        <div className="pointer-events-none absolute inset-x-0 bottom-0 flex flex-col gap-2 p-2 pb-[max(0.5rem,env(safe-area-inset-bottom))]">
+        <div
+          ref={stackRef}
+          className="pointer-events-none absolute inset-x-0 bottom-0 flex flex-col gap-2 p-2 pb-[max(0.5rem,env(safe-area-inset-bottom))]"
+        >
           {!sheetOpen && !selected ? <ActivityLog log={hud.log.slice(0, 1)} now={now} /> : null}
           {selected && !sheetOpen ? (
             <div className="pointer-events-auto">

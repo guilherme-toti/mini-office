@@ -18,7 +18,8 @@ living office:
   browser for web lookups. A bubble over each head says the same thing with an icon.
 - **Real-life routines.**
   - An agent that finishes waits at the desk with a raised hand, then goes off to play games,
-    sit on the terrace or relax in the lounge. Leave it long enough and it dozes off at its desk.
+    sit on the terrace or relax in the lounge. Leave it long enough and it naps on a sofa or a
+    bench.
   - A long command is a good excuse for a coffee.
   - New helpers are briefed in the meeting room by whoever called them, and they report back
     before leaving.

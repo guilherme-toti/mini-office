@@ -68,7 +68,7 @@ export function PersonCard({ person, people, now, onClose, onFocus }: PersonCard
 
   return (
     <article
-      className="panel max-h-[55dvh] overflow-y-auto p-3 lg:max-h-[calc(100dvh-220px)]"
+      className="panel max-h-[45dvh] overflow-y-auto p-3 lg:max-h-[calc(100dvh-220px)]"
       aria-label={person.name}
     >
       <header className="flex items-start gap-3">

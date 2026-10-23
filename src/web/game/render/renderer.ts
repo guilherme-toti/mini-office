@@ -7,7 +7,7 @@ import {
 } from '../gfx/avatar-art.ts';
 import { tileVariant } from '../gfx/floor-art.ts';
 import { FURNITURE_ANCHOR_X, FURNITURE_ANCHOR_Y } from '../gfx/furniture-art.ts';
-import { project } from '../gfx/iso.ts';
+import { HALF_W, project } from '../gfx/iso.ts';
 import {
   SCREEN_FRAMES,
   screenPatternFor,
@@ -57,6 +57,8 @@ const STACK_SELECTED = 34;
 const PLATE_HEIGHT = 38;
 /** Shared-space plates only show once you zoom in (CSS px per art pixel); teams always do. */
 const SHARED_PLATES_FROM = 1;
+/** Below this zoom (CSS px per art pixel) names only show for the person you point at. */
+const TINY_ZOOM = 0.5;
 const CULL_MARGIN = 64;
 
 export type SharedZone = Exclude<ZoneKind, 'team'>;
@@ -71,6 +73,8 @@ export interface RenderView {
   showNames: boolean;
   zoneNames: Record<SharedZone, string>;
   renovatingLabel: string;
+  /** Device px from the top that the HUD covers; labels never go under it. */
+  topLimit: number;
 }
 
 interface DrawnPerson {
@@ -403,7 +407,9 @@ export class Renderer {
     const selected = person.id === view.selectedId;
     let cursorY = item.head.y - (selected ? STACK_SELECTED : STACK_PLAIN) * item.scale;
 
-    const showName = view.showNames || person.id === view.hoverId || selected;
+    // At a far-out zoom every name would pile up, so only the one you point at shows.
+    const tiny = item.scale / dpr < TINY_ZOOM;
+    const showName = (view.showNames && !tiny) || person.id === view.hoverId || selected;
     if (showName && person.alpha > 0.5) {
       ctx.font = `500 ${TEXT_SIZE * dpr}px ${this.ink.font}`;
       const text = person.name;
@@ -411,6 +417,7 @@ export class Renderer {
       const height = 20 * dpr;
       const x = Math.round(onScreen(item.head.x - width / 2, width, view));
       const y = Math.round(placer.place(x, cursorY - height, width, height));
+      if (y < view.topLimit) return;
       ctx.fillStyle = this.ink.plate;
       roundRect(ctx, x, y, width, height, 4 * dpr);
       ctx.fill();
@@ -426,6 +433,7 @@ export class Renderer {
       const life = TUNING.bubbleTtl - bubble.age;
       ctx.globalAlpha = clamp(life / 0.6) * clamp(bubble.age / 0.15);
       const rise = Math.min(bubble.age, 0.4) * 10 * dpr;
+      if (cursorY + rise < view.topLimit) break;
       const top = this.drawBubble(
         person.name,
         bubble.text,
@@ -469,6 +477,8 @@ export class Renderer {
     // Keep the bubble on screen; only its tail has to point at the speaker.
     const x = Math.round(onScreen(centerX - width / 2, width, view));
     const y = Math.round(placer.place(x, bottom - height - tail, width, height + tail));
+    // Pushed up under the top bar: leave it out rather than half-hide it.
+    if (y < view.topLimit) return y;
 
     ctx.fillStyle = this.ink.bubble;
     ctx.strokeStyle = this.ink.bubbleBorder;
@@ -523,12 +533,16 @@ export class Renderer {
     const renovating = team && world.teamPhase(zone.id) === 'renovating';
     const size = TEXT_SIZE * dpr;
     ctx.font = `${team ? 700 : 500} ${size}px ${this.ink.font}`;
-    const nameWidth = ctx.measureText(name).width;
     const countText = team ? String(count) : '';
     const countWidth = countText ? ctx.measureText(countText).width + 18 * dpr : 0;
     const tag = renovating ? view.renovatingLabel : '';
     const tagWidth = tag ? ctx.measureText(tag).width + 14 * dpr : 0;
     const padding = 8 * dpr;
+    // A plate never gets much wider than its area, so it stays over the area it names.
+    const areaWidth = (zone.rect.w + zone.rect.d) * HALF_W * scale;
+    const room = Math.max(48 * dpr, areaWidth - padding * 2 - countWidth - tagWidth);
+    const label = fitText(ctx, name, room);
+    const nameWidth = ctx.measureText(label).width;
     const width = padding * 2 + nameWidth + countWidth + tagWidth;
     const height = (team ? 24 : 22) * dpr;
     const x = Math.round(onScreen(anchor.x - width / 2, width, view));
@@ -542,7 +556,7 @@ export class Renderer {
     ctx.stroke();
     ctx.textBaseline = 'middle';
     ctx.fillStyle = team ? this.ink.plateText : this.ink.plateMuted;
-    ctx.fillText(name, x + padding, y + height / 2 + dpr);
+    ctx.fillText(label, x + padding, y + height / 2 + dpr);
     let cursor = x + padding + nameWidth;
     if (countText) {
       // A tiny person glyph next to the head count.
@@ -570,6 +584,14 @@ export class Renderer {
 function onScreen(x: number, width: number, view: RenderView): number {
   const margin = 8 * view.dpr;
   return clamp(x, margin, Math.max(margin, view.width - width - margin));
+}
+
+/** Cuts text with an ellipsis so it fits `max` device px. */
+function fitText(ctx: CanvasRenderingContext2D, text: string, max: number): string {
+  if (ctx.measureText(text).width <= max) return text;
+  let end = text.length;
+  while (end > 1 && ctx.measureText(`${text.slice(0, end)}…`).width > max) end -= 1;
+  return `${text.slice(0, end)}…`;
 }
 
 function newestBubbles(people: readonly Person[]): Set<Bubble> {

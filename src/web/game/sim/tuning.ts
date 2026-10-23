@@ -1,11 +1,13 @@
 /** Every timing that shapes office life, in seconds unless the name says otherwise. */
 export const TUNING = {
-  walkSpeed: 2.4,
-  hurrySpeed: 4.2,
+  walkSpeed: 3,
+  hurrySpeed: 4.8,
   doorFade: 0.4,
+  /** Seconds between two people coming through the main door. */
+  doorGap: 0.8,
   /** After finishing, an agent waits at the desk with a raised hand this long… */
   waitAtDeskMs: 40_000,
-  /** …then takes a break in the lounge, and after this long dozes off back at the desk. */
+  /** …then relaxes in the shared spaces, and after this long naps on a sofa or bench there. */
   dozeAfterMs: 8 * 60_000,
   /** A command running longer than this is a good excuse for a coffee. */
   longCommandMs: 25_000,

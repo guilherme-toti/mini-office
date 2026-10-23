@@ -157,6 +157,49 @@ describe('world', () => {
     expect(world.log.some((entry) => entry.kind === 'left')).toBe(true);
   });
 
+  it('still briefs helpers who arrive while their area is being rebuilt', () => {
+    const world = new World({ say: en.say, seed: 7 });
+    const parent = agent('p', { activity: 'delegating' });
+    let now = run(world, [parent, agent('q')], START, 1);
+    // Four helpers at once overflow the area, so it renovates while they are briefed.
+    const helpers = [1, 2, 3, 4].map((index) =>
+      agent(`p/h${index}`, { kind: 'subagent', parentId: 'p', activitySince: now }),
+    );
+    const everyone = [parent, agent('q'), ...helpers];
+    now = run(world, everyone, now, 2);
+    expect(world.renovation?.zones.has('/p/app')).toBe(true);
+    let briefedInMeeting = 0;
+    for (let second = 0; second < 40; second += 1) {
+      now = run(world, everyone, now, 1);
+      for (const helper of helpers) {
+        const person = world.people.get(helper.id);
+        if (
+          person?.script?.kind === 'brief' &&
+          person.script.step > 0 &&
+          zoneOf(world, helper.id)?.kind === 'meeting'
+        ) {
+          briefedInMeeting += 1;
+        }
+      }
+    }
+    expect(helpers.every((helper) => world.people.get(helper.id)?.briefed)).toBe(true);
+    expect(briefedInMeeting).toBeGreaterThan(0);
+  });
+
+  it('lets an agent idle for ages nap somewhere comfy in the shared spaces', () => {
+    const world = new World({ say: en.say, seed: 8 });
+    const longAgo = START - 20 * 60_000;
+    run(
+      world,
+      [agent('a', { activity: 'waiting', activitySince: longAgo }), agent('b')],
+      START,
+      40,
+    );
+    const person = world.people.get('a');
+    expect(person && person.x < COMMONS_W).toBe(true);
+    expect(person && world.isDozing(person)).toBe(true);
+  });
+
   it('closes the area of a project nobody works on any more', () => {
     const world = new World({ say: en.say, seed: 5 });
     const now = run(world, [agent('a'), agent('b', { roomId: '/p/other' })], START, 1);

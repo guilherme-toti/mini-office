@@ -27,26 +27,32 @@ export class Camera {
   fit(bounds: PixelRect, width: number, height: number, insets: Insets, instant = false): void {
     const usableW = Math.max(1, width - insets.left - insets.right);
     const usableH = Math.max(1, height - insets.top - insets.bottom);
-    const fitting = SCALES.filter(
-      (scale) => bounds.width * scale <= usableW && bounds.height * scale <= usableH,
-    );
-    this.targetScale = fitting.at(-1) ?? SCALES[0];
-    // Center the office inside the free area, not the whole canvas.
-    const shiftX = (insets.left - insets.right) / 2 / this.targetScale;
-    const shiftY = (insets.top - insets.bottom) / 2 / this.targetScale;
-    this.targetX = bounds.x + bounds.width / 2 - shiftX;
-    this.targetY = bounds.y + bounds.height / 2 - shiftY;
+    const exact = Math.min(usableW / bounds.width, usableH / bounds.height);
+    // Below one device pixel per art pixel the art is soft anyway, so fit small screens exactly.
+    const step = SCALES.filter((scale) => scale <= exact).at(-1);
+    this.targetScale = step !== undefined && step >= 1 ? step : Math.max(0.25, exact);
+    this.center(bounds.x + bounds.width / 2, bounds.y + bounds.height / 2, insets);
     if (instant) this.snap();
   }
 
-  focus(x: number, y: number, minScale: number): void {
+  /** Puts a world point in the middle of the area the HUD leaves free. */
+  private center(x: number, y: number, insets: Insets): void {
+    this.targetX = x - (insets.left - insets.right) / 2 / this.targetScale;
+    this.targetY = y - (insets.top - insets.bottom) / 2 / this.targetScale;
+  }
+
+  focus(x: number, y: number, minScale: number, insets: Insets): void {
     this.autoFit = false;
-    this.targetX = x;
-    this.targetY = y;
     this.targetScale = Math.max(
       this.targetScale,
       SCALES.find((scale) => scale >= minScale) ?? minScale,
     );
+    this.center(x, y, insets);
+  }
+
+  /** Where `focus` aims, so callers can tell when the camera has arrived. */
+  get aim(): { x: number; y: number } {
+    return { x: this.targetX, y: this.targetY };
   }
 
   panBy(dx: number, dy: number): void {
