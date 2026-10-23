@@ -1,0 +1,64 @@
+@import '@fontsource/ubuntu/400.css';
+@import '@fontsource/ubuntu/500.css';
+@import '@fontsource/ubuntu/700.css';
+@import 'tailwindcss';
+
+/* Static, because the canvas renderer reads tokens that no utility class uses. */
+@theme static {
+  --font-ui: 'Ubuntu', ui-sans-serif, system-ui, sans-serif;
+
+  --color-void: #141827;
+  --color-ink: #1d1a2b;
+  --color-panel: #24213a;
+  --color-panel-raised: #2f2b4a;
+  --color-panel-edge: #4a4468;
+  --color-panel-shine: #5d5683;
+  --color-cream: #f4f0ff;
+  --color-muted: #b3abd1;
+  --color-faint: #8a82ab;
+  --color-sun: #ffd447;
+  --color-sun-deep: #d9a91c;
+  --color-mint: #5ee0a0;
+  --color-coral: #ff7a7a;
+  --color-sky: #7cc8f0;
+  --color-void-glow: #232a44;
+  --color-bubble: #ffffff;
+  --color-plate: rgb(20 18 34 / 0.86);
+  --color-amber: #f0a63c;
+  --color-shade: rgb(10 8 24 / 0.22);
+
+  --shadow-panel:
+    0 0 0 2px var(--color-ink), inset 0 1px 0 var(--color-panel-shine), 0 8px 24px rgb(0 0 0 / 0.35);
+  --shadow-chip: 0 0 0 2px var(--color-ink), inset 0 1px 0 rgb(255 255 255 / 0.18);
+}
+
+@layer base {
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+
+  body {
+    margin: 0;
+    background: var(--color-void);
+    color: var(--color-cream);
+    font-family: var(--font-ui);
+    -webkit-font-smoothing: antialiased;
+    overscroll-behavior: none;
+  }
+
+  canvas {
+    touch-action: none;
+  }
+}
+
+@utility pixelated {
+  image-rendering: pixelated;
+}
+
+@utility panel {
+  background: var(--color-panel);
+  border-radius: 10px;
+  box-shadow: var(--shadow-panel);
+}
